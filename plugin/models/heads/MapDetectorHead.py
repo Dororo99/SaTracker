@@ -17,7 +17,7 @@ from einops import rearrange
 @HEADS.register_module(force=True)
 class MapDetectorHead(nn.Module):
 
-    def __init__(self, 
+    def __init__(self,
                  num_queries,
                  num_classes=3,
                  in_channels=128,
@@ -35,7 +35,12 @@ class MapDetectorHead(nn.Module):
                  transformer=dict(),
                  loss_cls=dict(),
                  loss_reg=dict(),
-                 assigner=dict()
+                 assigner=dict(),
+                 num_free_queries=50,
+                 max_sd_queries=50,
+                 sd_attr_dim=4,
+                 sd_tag_dim=2,
+                 use_sd_queries=False,
                 ):
         super().__init__()
         self.num_queries = num_queries
@@ -47,6 +52,11 @@ class MapDetectorHead(nn.Module):
         self.bev_pos = bev_pos
         self.num_points = num_points
         self.coord_dim = coord_dim
+        self.num_free_queries = num_free_queries
+        self.max_sd_queries = max_sd_queries
+        self.sd_attr_dim = sd_attr_dim
+        self.sd_tag_dim = sd_tag_dim
+        self.use_sd_queries = use_sd_queries
         
         self.sync_cls_avg_factor = sync_cls_avg_factor
         self.bg_cls_weight = bg_cls_weight
@@ -121,10 +131,18 @@ class MapDetectorHead(nn.Module):
         self.bev_pos_embed = build_positional_encoding(positional_encoding)
 
         # query_pos_embed & query_embed
-        self.query_embedding = nn.Embedding(self.num_queries,
-                                            self.embed_dims)
-
-        self.reference_points_embed = nn.Linear(self.embed_dims, self.num_points * 2)
+        if self.use_sd_queries:
+            self.query_embedding = nn.Embedding(self.num_free_queries, self.embed_dims)
+            self.reference_points_embed = nn.Linear(self.embed_dims, self.num_points * 2)
+            sd_input_dim = self.num_points * 2 + self.sd_attr_dim + self.sd_tag_dim + 1  # +1 for reliability
+            self.sd_query_encoder = nn.Sequential(
+                nn.Linear(sd_input_dim, self.embed_dims),
+                nn.ReLU(),
+                nn.Linear(self.embed_dims, self.embed_dims),
+            )
+        else:
+            self.query_embedding = nn.Embedding(self.num_queries, self.embed_dims)
+            self.reference_points_embed = nn.Linear(self.embed_dims, self.num_points * 2)
         
     def _init_branch(self,):
         """Initialize classification branch and regression branch of head."""
@@ -172,7 +190,74 @@ class MapDetectorHead(nn.Module):
         assert list(bev_features.shape) == [B, self.embed_dims, H, W]
         return bev_features
 
-    def forward_train(self, bev_features, img_metas, gts, track_query_info=None, memory_bank=None, return_matching=False):
+    def build_sd_queries(self, sd_priors, device):
+        """Build SD query embeddings and reference points from SD priors.
+
+        Args:
+            sd_priors (dict): SD prior data for one sample
+                - polylines: [N, 20, 2] normalized
+                - labels: [N]
+                - attrs: [N, 4]
+                - has_tag_mask: [N, 2]
+                - reliability: [N]
+            device: torch device
+
+        Returns:
+            sd_embed: [N_sd, embed_dims]
+            sd_ref_pts: [N_sd, num_points, 2]
+            sd_reliability: [N_sd]
+            sd_labels: [N_sd]
+        """
+        polylines = torch.tensor(sd_priors['polylines'], dtype=torch.float32, device=device)
+        attrs = torch.tensor(sd_priors['attrs'], dtype=torch.float32, device=device)
+        has_tag = torch.tensor(sd_priors['has_tag_mask'], dtype=torch.float32, device=device)
+        reliability = torch.tensor(sd_priors['reliability'], dtype=torch.float32, device=device)
+        labels = torch.tensor(sd_priors['labels'], dtype=torch.long, device=device)
+
+        N = len(polylines)
+        if N == 0:
+            return (torch.zeros(0, self.embed_dims, device=device),
+                    torch.zeros(0, self.num_points, 2, device=device),
+                    torch.zeros(0, device=device),
+                    torch.zeros(0, dtype=torch.long, device=device))
+
+        # Cap at max_sd_queries with class-wise minimum guarantee
+        if N > self.max_sd_queries:
+            # Guarantee at least 5 per class
+            keep_indices = []
+            for cls_id in range(self.num_classes):
+                cls_mask = (labels == cls_id)
+                cls_indices = cls_mask.nonzero(as_tuple=True)[0]
+                if len(cls_indices) > 0:
+                    cls_rel = reliability[cls_indices]
+                    n_keep = min(len(cls_indices), max(5, self.max_sd_queries // self.num_classes))
+                    _, topk_idx = cls_rel.topk(min(n_keep, len(cls_indices)))
+                    keep_indices.append(cls_indices[topk_idx])
+
+            if keep_indices:
+                keep_indices = torch.cat(keep_indices)
+                # If still over budget, cut by reliability
+                if len(keep_indices) > self.max_sd_queries:
+                    _, topk = reliability[keep_indices].topk(self.max_sd_queries)
+                    keep_indices = keep_indices[topk]
+            else:
+                keep_indices = torch.arange(min(N, self.max_sd_queries), device=device)
+
+            polylines = polylines[keep_indices]
+            attrs = attrs[keep_indices]
+            has_tag = has_tag[keep_indices]
+            reliability = reliability[keep_indices]
+            labels = labels[keep_indices]
+
+        # Encode: concat polyline + attrs + has_tag + reliability
+        poly_flat = polylines.flatten(1)  # [N, 40]
+        sd_input = torch.cat([poly_flat, attrs, has_tag, reliability.unsqueeze(-1)], dim=-1)
+        sd_embed = self.sd_query_encoder(sd_input)  # [N, embed_dims]
+        sd_ref_pts = polylines  # [N, 20, 2]
+
+        return sd_embed, sd_ref_pts, reliability, labels
+
+    def forward_train(self, bev_features, img_metas, gts, track_query_info=None, memory_bank=None, return_matching=False, sd_query_info=None):
         '''
         Args:
             bev_feature (List[Tensor]): shape [B, C, H, W]
@@ -193,37 +278,151 @@ class MapDetectorHead(nn.Module):
         # pos_embed = self.positional_encoding(img_masks)
         pos_embed = None
 
-        query_embedding = self.query_embedding.weight[None, ...].repeat(bs, 1, 1) # [B, num_q, embed_dims]
-        input_query_num = self.num_queries
+        # Determine number of free queries
+        num_free = self.num_free_queries if self.use_sd_queries else self.num_queries
 
-        init_reference_points = self.reference_points_embed(query_embedding).sigmoid() # (bs, num_q, 2*num_pts)
-        init_reference_points = init_reference_points.view(-1, self.num_queries, self.num_points, 2) # (bs, num_q, num_pts, 2)
-        
-        assert list(init_reference_points.shape) == [bs, self.num_queries, self.num_points, 2]
-        assert list(query_embedding.shape) == [bs, self.num_queries, self.embed_dims]
+        query_embedding = self.query_embedding.weight[None, ...].repeat(bs, 1, 1) # [B, num_free, embed_dims]
+        input_query_num = num_free
+
+        init_reference_points = self.reference_points_embed(query_embedding).sigmoid() # (bs, num_free, 2*num_pts)
+        init_reference_points = init_reference_points.view(-1, num_free, self.num_points, 2) # (bs, num_free, num_pts, 2)
+
+        if self.use_sd_queries and sd_query_info is not None:
+            # Build per-batch SD + free + pad queries
+            new_query_embeds = []
+            new_init_ref_pts = []
+            query_meta_list = []
+
+            for b_i in range(bs):
+                sd_embed_b = sd_query_info[b_i]['sd_embed']  # [N_sd, embed_dims]
+                sd_ref_b = sd_query_info[b_i]['sd_ref_pts']   # [N_sd, num_points, 2]
+                n_sd = len(sd_embed_b)
+
+                # Pad SD queries to max_sd_queries
+                sd_pad_len = self.max_sd_queries - n_sd
+                if sd_pad_len > 0:
+                    sd_embed_padded = torch.cat([sd_embed_b,
+                        torch.zeros(sd_pad_len, self.embed_dims, device=sd_embed_b.device)])
+                    sd_ref_padded = torch.cat([sd_ref_b,
+                        torch.zeros(sd_pad_len, self.num_points, 2, device=sd_ref_b.device)])
+                else:
+                    sd_embed_padded = sd_embed_b
+                    sd_ref_padded = sd_ref_b
+
+                # SD padding mask
+                sd_mask = torch.zeros(self.max_sd_queries, dtype=torch.bool, device=sd_embed_b.device)
+                sd_mask[n_sd:] = True
+
+                # Combine: [sd(max_sd), free(num_free)]
+                combined_embed = torch.cat([sd_embed_padded, query_embedding[b_i]], dim=0)
+                combined_ref = torch.cat([sd_ref_padded, init_reference_points[b_i]], dim=0)
+
+                new_query_embeds.append(combined_embed)
+                new_init_ref_pts.append(combined_ref)
+
+                # Build query_meta
+                n_total = self.max_sd_queries + num_free
+                query_type = torch.full((n_total,), 2, dtype=torch.long, device=sd_embed_b.device)  # free=2
+                query_type[:self.max_sd_queries] = 1  # sd=1
+                query_type[n_sd:self.max_sd_queries] = 3  # sd padding=3
+
+                reliability = torch.ones(n_total, device=sd_embed_b.device)
+                reliability[:n_sd] = sd_query_info[b_i]['sd_reliability']
+                reliability[n_sd:self.max_sd_queries] = 0.0  # sd padding
+
+                # SD query labels for same-class matching in SDPriorCost
+                sd_query_labels = torch.full((n_total,), -1, dtype=torch.long, device=sd_embed_b.device)
+                if n_sd > 0:
+                    sd_query_labels[:n_sd] = sd_query_info[b_i]['sd_labels']
+
+                query_meta_list.append({
+                    'num_sd': n_sd,
+                    'num_free': num_free,
+                    'query_type': query_type,
+                    'reliability': reliability,
+                    'sd_query_labels': sd_query_labels,
+                })
+
+            query_embedding = torch.stack(new_query_embeds, dim=0)
+            init_reference_points = torch.stack(new_init_ref_pts, dim=0)
 
         # Prepare the propagated track queries, concat with the original dummy queries
         if track_query_info is not None and 'track_query_hs_embeds' in track_query_info[0]:
-            new_query_embeds = []
-            new_init_ref_pts = []
+            final_query_embeds = []
+            final_ref_pts = []
+            final_query_meta = []
+
             for b_i in range(bs):
-                new_queries = torch.cat([track_query_info[b_i]['track_query_hs_embeds'], query_embedding[b_i], 
-                           track_query_info[b_i]['pad_hs_embeds']], dim=0)
-                new_query_embeds.append(new_queries)
-                init_ref = rearrange(init_reference_points[b_i], 'n k c -> n (k c)', c=2)
-                new_ref = torch.cat([track_query_info[b_i]['trans_track_query_boxes'], init_ref, 
-                           track_query_info[b_i]['pad_query_boxes']], dim=0)
-                new_ref = rearrange(new_ref, 'n (k c) -> n k c', c=2)
-                new_init_ref_pts.append(new_ref)
-                #print('length of track queries', track_query_info[b_i]['track_query_hs_embeds'].shape[0])
+                track_embed = track_query_info[b_i]['track_query_hs_embeds']
+                track_ref = track_query_info[b_i]['trans_track_query_boxes']
+                track_ref = rearrange(track_ref, 'n (k c) -> n k c', c=2)
+                pad_embed = track_query_info[b_i]['pad_hs_embeds']
+                pad_ref = track_query_info[b_i]['pad_query_boxes']
+                pad_ref = rearrange(pad_ref, 'n (k c) -> n k c', c=2)
+                n_track = len(track_embed)
+                n_pad = len(pad_embed)
 
+                # [track, sd+free, pad]
+                combined = torch.cat([track_embed, query_embedding[b_i], pad_embed], dim=0)
+                combined_ref = torch.cat([track_ref, init_reference_points[b_i], pad_ref], dim=0)
 
-            # concat to get the track+dummy queries
-            query_embedding = torch.stack(new_query_embeds, dim=0)
-            init_reference_points = torch.stack(new_init_ref_pts, dim=0)
+                final_query_embeds.append(combined)
+                final_ref_pts.append(combined_ref)
+
+                # Update query_meta with track and pad info
+                if self.use_sd_queries and sd_query_info is not None:
+                    meta = query_meta_list[b_i]
+                    n_sd_free = self.max_sd_queries + num_free
+
+                    track_type = torch.zeros(n_track, dtype=torch.long, device=combined.device)  # track=0
+                    pad_type = torch.full((n_pad,), 3, dtype=torch.long, device=combined.device)  # pad=3
+                    full_type = torch.cat([track_type, meta['query_type'], pad_type])
+
+                    track_rel = torch.ones(n_track, device=combined.device)
+                    pad_rel = torch.zeros(n_pad, device=combined.device)
+                    full_rel = torch.cat([track_rel, meta['reliability'], pad_rel])
+
+                    # Propagate sd_query_labels
+                    track_sd_labels = torch.full((n_track,), -1, dtype=torch.long, device=combined.device)
+                    pad_sd_labels = torch.full((n_pad,), -1, dtype=torch.long, device=combined.device)
+                    full_sd_labels = torch.cat([track_sd_labels, meta['sd_query_labels'], pad_sd_labels])
+
+                    final_query_meta.append({
+                        'num_track': n_track,
+                        'num_sd': meta['num_sd'],
+                        'num_free': meta['num_free'],
+                        'query_type': full_type,
+                        'reliability': full_rel,
+                        'sd_query_labels': full_sd_labels,
+                    })
+
+            query_embedding = torch.stack(final_query_embeds, dim=0)
+            init_reference_points = torch.stack(final_ref_pts, dim=0)
             query_kp_mask = torch.stack([t['query_padding_mask'] for t in track_query_info], dim=0)
+
+            # Extend padding mask with SD padding
+            if self.use_sd_queries and sd_query_info is not None:
+                # Reconstruct kp_mask: track_mask + sd_pad_mask + free_false + pad_true
+                new_kp_masks = []
+                for b_i in range(bs):
+                    meta = final_query_meta[b_i]
+                    total = len(final_query_embeds[b_i])
+                    mask = torch.zeros(total, dtype=torch.bool, device=query_embedding.device)
+                    # sd padding positions
+                    qt = meta['query_type']
+                    mask[qt == 3] = True  # pad positions
+                    new_kp_masks.append(mask)
+                query_kp_mask = torch.stack(new_kp_masks, dim=0)
         else:
-            query_kp_mask = query_embedding.new_zeros((bs, self.num_queries), dtype=torch.bool)
+            if self.use_sd_queries and sd_query_info is not None:
+                query_kp_mask = torch.zeros((bs, query_embedding.shape[1]), dtype=torch.bool, device=query_embedding.device)
+                for b_i in range(bs):
+                    qt = query_meta_list[b_i]['query_type']
+                    query_kp_mask[b_i, qt == 3] = True  # sd padding
+                final_query_meta = query_meta_list
+            else:
+                query_kp_mask = query_embedding.new_zeros((bs, self.num_queries), dtype=torch.bool)
+                final_query_meta = None
         
         # outs_dec: (num_layers, num_qs, bs, embed_dims)
         inter_queries, init_reference, inter_references = self.transformer(
@@ -261,6 +460,24 @@ class MapDetectorHead(nn.Module):
             }
             if return_matching:
                 pred_dict['hs_embeds'] = queries
+            if self.use_sd_queries and final_query_meta is not None:
+                pred_dict['query_meta'] = final_query_meta
+                # Store SD init lines for SDPriorCost
+                if sd_query_info is not None:
+                    sd_init_lines_list = []
+                    for b_i in range(bs):
+                        meta = final_query_meta[b_i]
+                        total_q = reg_points_list[b_i].shape[0]
+                        sd_init = torch.zeros(total_q, 2 * self.num_points, device=reg_points_list[b_i].device)
+                        n_track = meta['num_track'] if 'num_track' in meta else 0
+                        n_sd = meta['num_sd']
+                        sd_start = n_track
+                        sd_end = n_track + n_sd
+                        if n_sd > 0:
+                            sd_ref = sd_query_info[b_i]['sd_ref_pts'][:n_sd].flatten(1)  # [n_sd, 40]
+                            sd_init[sd_start:sd_end] = sd_ref
+                        sd_init_lines_list.append(sd_init)
+                    pred_dict['sd_init_lines'] = sd_init_lines_list
             outputs.append(pred_dict)
 
         # Pass in the track query information to massage the cost matrix
@@ -272,7 +489,7 @@ class MapDetectorHead(nn.Module):
         else:
             return outputs, loss_dict, det_match_idxs, det_match_gt_idxs, gt_info_list
     
-    def forward_test(self, bev_features, img_metas, track_query_info=None, memory_bank=None):
+    def forward_test(self, bev_features, img_metas, track_query_info=None, memory_bank=None, sd_query_info=None):
         '''
         Args:
             bev_feature (List[Tensor]): shape [B, C, H, W]
@@ -290,20 +507,51 @@ class MapDetectorHead(nn.Module):
 
         bs, C, H, W = bev_features.shape
         assert bs == 1, 'Only support bs=1 per-gpu for inference'
-        
+
         img_masks = bev_features.new_zeros((bs, H, W))
         # pos_embed = self.positional_encoding(img_masks)
         pos_embed = None
 
-        query_embedding = self.query_embedding.weight[None, ...].repeat(bs, 1, 1) # [B, num_q, embed_dims]
-        input_query_num = self.num_queries
+        # Determine number of free queries
+        num_free = self.num_free_queries if self.use_sd_queries else self.num_queries
+
+        query_embedding = self.query_embedding.weight[None, ...].repeat(bs, 1, 1) # [B, num_free, embed_dims]
+        input_query_num = num_free
         # num query: self.num_query + self.topk
-        
-        init_reference_points = self.reference_points_embed(query_embedding).sigmoid() # (bs, num_q, 2*num_pts)
-        init_reference_points = init_reference_points.view(-1, self.num_queries, self.num_points, 2) # (bs, num_q, num_pts, 2)
-        
-        assert list(init_reference_points.shape) == [bs, input_query_num, self.num_points, 2]
-        assert list(query_embedding.shape) == [bs, input_query_num, self.embed_dims]
+
+        init_reference_points = self.reference_points_embed(query_embedding).sigmoid() # (bs, num_free, 2*num_pts)
+        init_reference_points = init_reference_points.view(-1, num_free, self.num_points, 2) # (bs, num_free, num_pts, 2)
+
+        if self.use_sd_queries and sd_query_info is not None:
+            # Build SD + free queries for each batch
+            new_query_embeds = []
+            new_init_ref_pts = []
+
+            for b_i in range(bs):
+                sd_embed_b = sd_query_info[b_i]['sd_embed']
+                sd_ref_b = sd_query_info[b_i]['sd_ref_pts']
+                n_sd = len(sd_embed_b)
+
+                # Pad SD queries to max_sd_queries
+                sd_pad_len = self.max_sd_queries - n_sd
+                if sd_pad_len > 0:
+                    sd_embed_padded = torch.cat([sd_embed_b,
+                        torch.zeros(sd_pad_len, self.embed_dims, device=sd_embed_b.device)])
+                    sd_ref_padded = torch.cat([sd_ref_b,
+                        torch.zeros(sd_pad_len, self.num_points, 2, device=sd_ref_b.device)])
+                else:
+                    sd_embed_padded = sd_embed_b
+                    sd_ref_padded = sd_ref_b
+
+                # Combine: [sd(max_sd), free(num_free)]
+                combined_embed = torch.cat([sd_embed_padded, query_embedding[b_i]], dim=0)
+                combined_ref = torch.cat([sd_ref_padded, init_reference_points[b_i]], dim=0)
+
+                new_query_embeds.append(combined_embed)
+                new_init_ref_pts.append(combined_ref)
+
+            query_embedding = torch.stack(new_query_embeds, dim=0)
+            init_reference_points = torch.stack(new_init_ref_pts, dim=0)
 
         # Prepare the propagated track queries, concat with the original dummy queries
         if track_query_info is not None and 'track_query_hs_embeds' in track_query_info[0]:
@@ -314,8 +562,44 @@ class MapDetectorHead(nn.Module):
             # concat to get the track+dummy queries
             query_embedding = torch.cat([prev_hs_embed, query_embedding], dim=1)
             init_reference_points = torch.cat([prev_boxes, init_reference_points], dim=1)
-            
+
         query_kp_mask = query_embedding.new_zeros((bs, query_embedding.shape[1]), dtype=torch.bool)
+
+        test_query_meta = None
+        if self.use_sd_queries and sd_query_info is not None:
+            test_query_meta = []
+            # Mask SD padding positions and build query_meta for inference
+            for b_i in range(bs):
+                n_sd = len(sd_query_info[b_i]['sd_embed'])
+                n_track = 0
+                if track_query_info is not None and 'track_query_hs_embeds' in track_query_info[0]:
+                    n_track = track_query_info[b_i]['track_query_hs_embeds'].shape[0]
+                sd_pad_start = n_track + n_sd
+                sd_pad_end = n_track + self.max_sd_queries
+                query_kp_mask[b_i, sd_pad_start:sd_pad_end] = True
+
+                # Build query_meta for this batch item
+                total_q = query_embedding.shape[1]
+                qt = torch.full((total_q,), 2, dtype=torch.long, device=query_embedding.device)  # default free
+                qt[:n_track] = 0  # track
+                qt[n_track:n_track + self.max_sd_queries] = 1  # sd
+                qt[n_track + n_sd:n_track + self.max_sd_queries] = 3  # sd padding
+                # pad queries (if any beyond track+sd+free)
+                n_sd_free = self.max_sd_queries + self.num_free_queries
+                if total_q > n_track + n_sd_free:
+                    qt[n_track + n_sd_free:] = 3  # extra padding
+
+                rel = torch.ones(total_q, device=query_embedding.device)
+                rel[n_track:n_track + n_sd] = sd_query_info[b_i]['sd_reliability']
+                rel[qt == 3] = 0.0
+
+                test_query_meta.append({
+                    'num_track': n_track,
+                    'num_sd': n_sd,
+                    'num_free': self.num_free_queries,
+                    'query_type': qt,
+                    'reliability': rel,
+                })
 
         # outs_dec: (num_layers, num_qs, bs, embed_dims)
         inter_queries, init_reference, inter_references = self.transformer(
@@ -351,6 +635,8 @@ class MapDetectorHead(nn.Module):
                 'scores': scores_list,
                 'hs_embeds': queries,
             }
+            if test_query_meta is not None:
+                pred_dict['query_meta'] = test_query_meta
             outputs.append(pred_dict)
 
         return outputs
@@ -362,7 +648,9 @@ class MapDetectorHead(nn.Module):
                            gt_labels,
                            gt_lines,
                            track_info=None,
-                           gt_bboxes_ignore=None):
+                           gt_bboxes_ignore=None,
+                           query_meta=None,
+                           sd_init_lines=None):
         """
             Compute regression and classification targets for one image.
             Outputs from a single decoder layer of a single feature level are used.
@@ -394,7 +682,12 @@ class MapDetectorHead(nn.Module):
         
         # We massage the matching cost here using the track info, following
         # the 3-type supervision of TrackFormer/MOTR
-        assign_result, gt_permute_idx, matched_reg_cost = self.assigner.assign(preds=dict(lines=lines_pred, scores=score_pred,),
+        preds_for_assign = dict(lines=lines_pred, scores=score_pred)
+        if query_meta is not None:
+            preds_for_assign['query_meta'] = query_meta
+        if sd_init_lines is not None:
+            preds_for_assign['sd_init_lines'] = sd_init_lines
+        assign_result, gt_permute_idx, matched_reg_cost = self.assigner.assign(preds=preds_for_assign,
                                              gts=dict(lines=gt_lines,
                                                       labels=gt_labels, ),
                                              track_info=track_info,
@@ -410,6 +703,14 @@ class MapDetectorHead(nn.Module):
                 (num_pred_lines, ), self.num_classes, dtype=torch.long) # (num_q, )
         labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
         label_weights = gt_lines.new_ones(num_pred_lines) # (num_q, )
+
+        # SD negative down-weighting
+        if query_meta is not None:
+            sd_mask = (query_meta['query_type'] == 1)  # SD queries
+            neg_mask = (labels == self.num_classes)  # background
+            sd_neg_mask = sd_mask & neg_mask
+            if sd_neg_mask.any():
+                label_weights[sd_neg_mask] *= query_meta['reliability'][sd_neg_mask] * 0.3
 
         lines_target = torch.zeros_like(lines_pred) # (num_q, 2*num_pts)
         lines_weights = torch.zeros_like(lines_pred) # (num_q, 2*num_pts)
@@ -440,7 +741,7 @@ class MapDetectorHead(nn.Module):
                 pos_inds, neg_inds, pos_gt_inds, matched_reg_cost)
 
     # @force_fp32(apply_to=('preds', 'gts'))
-    def get_targets(self, preds, gts, track_info=None, gt_bboxes_ignore_list=None):
+    def get_targets(self, preds, gts, track_info=None, gt_bboxes_ignore_list=None, query_meta=None):
         """
             Compute regression and classification targets for a batch image.
             Outputs from a single decoder layer of a single feature level are used.
@@ -479,11 +780,20 @@ class MapDetectorHead(nn.Module):
         if track_info is None:
             track_info = [track_info for _ in range(len(gt_labels))]
 
+        if query_meta is None:
+            query_meta = [None for _ in range(len(gt_labels))]
+
+        # Prepare per-sample sd_init_lines
+        sd_init_lines_list = preds.get('sd_init_lines', None)
+        if sd_init_lines_list is None:
+            sd_init_lines_list = [None for _ in range(len(gt_labels))]
+
         (labels_list, label_weights_list,
         lines_targets_list, lines_weights_list,
         pos_inds_list, neg_inds_list,pos_gt_inds_list, matched_reg_cost) = multi_apply(
             self._get_target_single, preds['scores'], lines_pred,
-            gt_labels, gt_lines, track_info, gt_bboxes_ignore=gt_bboxes_ignore_list)
+            gt_labels, gt_lines, track_info, gt_bboxes_ignore=gt_bboxes_ignore_list,
+            query_meta=query_meta, sd_init_lines=sd_init_lines_list)
         
         num_total_pos = sum((inds.numel() for inds in pos_inds_list))
         num_total_neg = sum((inds.numel() for inds in neg_inds_list))
@@ -528,8 +838,9 @@ class MapDetectorHead(nn.Module):
         """
 
         # Get target for each sample
+        query_meta = preds.get('query_meta', None)
         new_gts, num_total_pos, num_total_neg, pos_inds_list, pos_gt_inds_list, matched_reg_cost =\
-            self.get_targets(preds, gts, track_info, gt_bboxes_ignore_list)
+            self.get_targets(preds, gts, track_info, gt_bboxes_ignore_list, query_meta=query_meta)
 
         # Batched all data
         # for k, v in new_gts.items():
@@ -645,14 +956,19 @@ class MapDetectorHead(nn.Module):
         lines = preds_dict['lines'] # List[Tensor(num_queries, 2*num_points)]
         bs = len(lines)
         scores = preds_dict['scores'] # (bs, num_queries, 3)
+        query_meta = preds_dict.get('query_meta', None)
 
         results = []
         for i in range(bs):
             tmp_vectors = lines[i]
-            # set up the prop_flags
-            tmp_prop_flags = torch.zeros(tmp_vectors.shape[0]).bool()
-            tmp_prop_flags[-100:] = 0
-            tmp_prop_flags[:-100] = 1
+            # set up the prop_flags using query_meta
+            if self.use_sd_queries and query_meta is not None:
+                qt = query_meta[i]['query_type']
+                tmp_prop_flags = (qt == 0)  # track=0 → prop=True, sd/free/pad → False
+            else:
+                tmp_prop_flags = torch.zeros(tmp_vectors.shape[0]).bool()
+                tmp_prop_flags[-self.num_queries:] = 0
+                tmp_prop_flags[:-self.num_queries] = 1
             num_preds, num_points2 = tmp_vectors.shape
             tmp_vectors = tmp_vectors.view(num_preds, num_points2//2, 2)
 
@@ -666,10 +982,20 @@ class MapDetectorHead(nn.Module):
                 bg_cls = self.cls_out_channels
                 pos = tmp_labels != bg_cls
 
+            # Exclude padding queries (type==3)
+            if self.use_sd_queries and query_meta is not None:
+                qt = query_meta[i]['query_type']
+                pos = pos & (qt != 3)
+
             tmp_vectors = tmp_vectors[pos]
             tmp_scores = tmp_scores[pos]
             tmp_labels = tmp_labels[pos]
             tmp_prop_flags = tmp_prop_flags[pos]
+
+            # Dedup: same class + Chamfer < threshold → keep higher score
+            if self.use_sd_queries and len(tmp_scores) > 1:
+                tmp_vectors, tmp_scores, tmp_labels, tmp_prop_flags = \
+                    self._dedup_predictions(tmp_vectors, tmp_scores, tmp_labels, tmp_prop_flags)
 
             if len(tmp_scores) == 0:
                 single_result = {
@@ -703,8 +1029,51 @@ class MapDetectorHead(nn.Module):
                 single_result['track_labels'] = []
 
             results.append(single_result)
-    
+
         return results
+
+    def _dedup_predictions(self, vectors, scores, labels, prop_flags, chamfer_thr=0.05):
+        """Remove duplicate predictions: same class + Chamfer < threshold.
+        Priority: track (prop=True) > sd/free (prop=False), then by score.
+
+        Args:
+            vectors: [N, num_points, 2]
+            scores: [N]
+            labels: [N]
+            prop_flags: [N] bool, True for track queries
+        Returns:
+            filtered vectors, scores, labels, prop_flags
+        """
+        N = len(scores)
+        keep = torch.ones(N, dtype=torch.bool, device=scores.device)
+
+        for i in range(N):
+            if not keep[i]:
+                continue
+            for j in range(i + 1, N):
+                if not keep[j]:
+                    continue
+                if labels[i] != labels[j]:
+                    continue
+                # Chamfer distance
+                dist_mat = torch.cdist(vectors[i].unsqueeze(0), vectors[j].unsqueeze(0))[0]
+                d12 = dist_mat.min(-1)[0].mean()
+                d21 = dist_mat.min(-2)[0].mean()
+                chamfer = (d12 + d21) / 2
+                if chamfer < chamfer_thr:
+                    # Decide which to remove: track > non-track, then higher score wins
+                    if prop_flags[i] and not prop_flags[j]:
+                        keep[j] = False
+                    elif not prop_flags[i] and prop_flags[j]:
+                        keep[i] = False
+                        break
+                    elif scores[i] >= scores[j]:
+                        keep[j] = False
+                    else:
+                        keep[i] = False
+                        break
+
+        return vectors[keep], scores[keep], labels[keep], prop_flags[keep]
     
     def prepare_temporal_propagation(self, preds_dict, scene_name, local_idx, memory_bank=None, 
                         thr_track=0.1, thr_det=0.5):
@@ -719,13 +1088,26 @@ class MapDetectorHead(nn.Module):
         tmp_vectors = lines[0]
         tmp_queries = queries[0]
 
+        query_meta = preds_dict.get('query_meta', None)
+
         # focal loss
         if self.loss_cls.use_sigmoid:
             tmp_scores, tmp_labels = scores[0].max(-1)
             tmp_scores = tmp_scores.sigmoid()
-            pos_track = tmp_scores[:-100] > thr_track
-            pos_det = tmp_scores[-100:] > thr_det
-            pos = torch.cat([pos_track, pos_det], dim=0)
+
+            if self.use_sd_queries and query_meta is not None:
+                qt = query_meta[0]['query_type']
+                track_mask = (qt == 0)  # track queries
+                det_mask = (qt == 1) | (qt == 2)  # sd + free queries
+                pos_track = track_mask & (tmp_scores > thr_track)
+                pos_det = det_mask & (tmp_scores > thr_det)
+                pos = pos_track | pos_det
+                # Exclude padding queries
+                pos = pos & (qt != 3)
+            else:
+                pos_track = tmp_scores[:-self.num_queries] > thr_track
+                pos_det = tmp_scores[-self.num_queries:] > thr_det
+                pos = torch.cat([pos_track, pos_det], dim=0)
         else:
             raise RuntimeError('The experiment uses sigmoid for cls outputs')
 
@@ -740,8 +1122,16 @@ class MapDetectorHead(nn.Module):
         else:
             prop_ids = self.prop_info['global_ids']
             prop_num_instance = self.prop_info['num_instance']
-            global_ids_track = prop_ids[pos_track]
-            num_newborn = int(pos_det.sum())
+
+            if self.use_sd_queries and query_meta is not None:
+                # pos_track is a full-length boolean mask; extract track-only positives
+                track_pos_mask = pos_track[track_mask] if track_mask.any() else pos_track[:0]
+                global_ids_track = prop_ids[track_pos_mask]
+                num_newborn = int((pos_det).sum())
+            else:
+                global_ids_track = prop_ids[pos_track]
+                num_newborn = int(pos_det.sum())
+
             global_ids_newborn = torch.arange(num_newborn) + prop_num_instance
             global_ids = torch.cat([global_ids_track, global_ids_newborn])
             num_instance = prop_num_instance + num_newborn

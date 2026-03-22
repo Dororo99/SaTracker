@@ -18,7 +18,7 @@ img_w = 800
 img_size = (img_h, img_w)
 num_cams = 6
 
-num_gpus = 8
+num_gpus = 4
 batch_size = 3
 num_iters_per_epoch = 27846 // (num_gpus * batch_size)
 num_epochs = 18
@@ -450,7 +450,13 @@ log_config = dict(
     interval=50,
     hooks=[
         dict(type='TextLoggerHook'),
-        dict(type='TensorboardLoggerHook')
+        dict(type='TensorboardLoggerHook'),
+        dict(type='WandbLoggerHook',
+             init_kwargs=dict(
+                 entity='IRCV_Mapping',
+                 project='sdmaptracker',
+                 name='newsplit-stage1_bev_pretrain',
+             )),
     ])
 
 SyncBN = True

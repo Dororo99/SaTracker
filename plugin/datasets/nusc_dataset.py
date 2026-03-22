@@ -25,10 +25,19 @@ class NuscDataset(BaseMapDataset):
         test_mode (bool): whether in test mode
     """
     
-    def __init__(self, data_root, **kwargs):
+    def __init__(self, data_root, sd_prior_cache_path=None, **kwargs):
         super().__init__(**kwargs)
         self.map_extractor = NuscMapExtractor(data_root, self.roi_size)
         self.renderer = Renderer(self.cat2id, self.roi_size, 'nusc')
+
+        # Load SD prior cache
+        self.sd_prior_cache = {}
+        if sd_prior_cache_path is not None:
+            import os
+            if os.path.exists(sd_prior_cache_path):
+                with open(sd_prior_cache_path, 'rb') as f:
+                    self.sd_prior_cache = pickle.load(f)
+                print(f'Loaded SD prior cache: {len(self.sd_prior_cache)} samples from {sd_prior_cache_path}')
     
     def load_annotations(self, ann_file):
         """Load annotations from ann_file.
@@ -150,5 +159,18 @@ class NuscDataset(BaseMapDataset):
             'lidar2ego_translation': sample['lidar2ego_translation'],
             'lidar2ego_rotation': sample['lidar2ego_rotation'],
         }
+
+        # SD prior
+        token = sample['token']
+        if token in self.sd_prior_cache:
+            input_dict['sd_priors'] = self.sd_prior_cache[token]
+        else:
+            input_dict['sd_priors'] = {
+                'polylines': np.zeros((0, 20, 2), dtype=np.float32),
+                'labels': np.zeros((0,), dtype=np.int64),
+                'attrs': np.zeros((0, 4), dtype=np.float32),
+                'has_tag_mask': np.zeros((0, 2), dtype=bool),
+                'reliability': np.zeros((0,), dtype=np.float32),
+            }
 
         return input_dict

@@ -362,9 +362,67 @@ class BBoxLogitsCost(object):
 
 
 @MATCH_COST.register_module()
+class SDPriorCost(object):
+    """Cost based on SD prior init polyline proximity to GT.
+    Only applies to SD queries (query_type==1) and same-class GT.
+
+    Args:
+        weight (float): loss weight, default 5.0
+    """
+
+    def __init__(self, weight=5.0):
+        self.weight = weight
+
+    def __call__(self, sd_init_lines, gt_lines, query_meta, gt_labels):
+        """
+        Args:
+            sd_init_lines (Tensor): SD prior init polylines [num_query, 2*num_points]
+            gt_lines (Tensor): GT lines [num_gt, 2*num_points]
+            query_meta (dict): contains 'query_type' and 'reliability'
+            gt_labels (Tensor): GT labels [num_gt]
+
+        Returns:
+            cost (Tensor): [num_query, num_gt] - additive cost (lower = better match)
+        """
+        num_q = len(sd_init_lines)
+        num_gt = len(gt_lines)
+
+        if num_q == 0 or num_gt == 0:
+            return sd_init_lines.new_zeros(num_q, num_gt)
+
+        query_type = query_meta['query_type']
+        reliability = query_meta['reliability']
+
+        # Only SD queries (type==1) get prior cost
+        sd_mask = (query_type == 1)
+
+        if not sd_mask.any():
+            return sd_init_lines.new_zeros(num_q, num_gt)
+
+        # L1 distance between SD init polylines and GT
+        num_pts = sd_init_lines.shape[-1] // 2
+        sd_expanded = sd_init_lines.unsqueeze(1).expand(-1, num_gt, -1)  # [num_q, num_gt, 40]
+        gt_expanded = gt_lines.unsqueeze(0).expand(num_q, -1, -1)        # [num_q, num_gt, 40]
+        l1_dist = (sd_expanded - gt_expanded).abs().sum(-1) / num_pts    # [num_q, num_gt]
+
+        # Same-class restriction: only apply cost when SD query class matches GT class
+        sd_query_labels = query_meta.get('sd_query_labels', None)
+        if sd_query_labels is not None:
+            # sd_query_labels: [num_q], gt_labels: [num_gt]
+            same_class = (sd_query_labels.unsqueeze(1) == gt_labels.unsqueeze(0))  # [num_q, num_gt]
+            l1_dist = l1_dist * same_class.float()
+
+        # Apply only to SD queries, weighted by reliability
+        cost = torch.zeros_like(l1_dist)
+        cost[sd_mask] = l1_dist[sd_mask] * reliability[sd_mask, None]
+
+        return cost * self.weight
+
+
+@MATCH_COST.register_module()
 class MapQueriesCost(object):
 
-    def __init__(self, cls_cost, reg_cost, iou_cost=None):
+    def __init__(self, cls_cost, reg_cost, iou_cost=None, sd_prior_cost=None):
 
         self.cls_cost = build_match_cost(cls_cost)
         self.reg_cost = build_match_cost(reg_cost)
@@ -372,6 +430,10 @@ class MapQueriesCost(object):
         self.iou_cost = None
         if iou_cost is not None:
             self.iou_cost = build_match_cost(iou_cost)
+
+        self.sd_prior_cost = None
+        if sd_prior_cost is not None:
+            self.sd_prior_cost = build_match_cost(sd_prior_cost)
 
     def __call__(self, preds: dict, gts: dict):
 
@@ -393,6 +455,13 @@ class MapQueriesCost(object):
 
         # weighted sum of above three costs
         cost = cls_cost + reg_cost
+
+        # SD prior cost (optional)
+        if self.sd_prior_cost is not None and 'sd_init_lines' in preds and 'query_meta' in preds:
+            sd_cost = self.sd_prior_cost(
+                preds['sd_init_lines'], gts['lines'],
+                preds['query_meta'], gts['labels'])
+            cost = cost + sd_cost
 
         # Need to pass the reg cost out, and use this to filter deviated
         # instances for temporal label assignment...

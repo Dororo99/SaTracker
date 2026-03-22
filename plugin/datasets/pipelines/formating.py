@@ -68,7 +68,10 @@ class FormatBundleMap(object):
             # vectors may have different sizes
             vectors = results['vectors']
             results['vectors'] = DC(vectors, stack=False, cpu_only=True)
-        
+
+        if 'sd_priors' in results:
+            results['sd_priors'] = DC(results['sd_priors'], stack=False, cpu_only=True)
+
         if 'polys' in results:
             results['polys'] = DC(results['polys'], stack=False, cpu_only=True)
         

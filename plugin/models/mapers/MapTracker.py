@@ -58,6 +58,12 @@ class MapTracker(BaseMapper):
         self.head = build_head(head_cfg)
         self.num_decoder_layers = self.head.transformer.decoder.num_layers
         self.skip_vector_head = skip_vector_head
+
+        # SD map query config
+        self.use_sd_queries = head_cfg.get('use_sd_queries', False)
+        self.max_sd_queries = head_cfg.get('max_sd_queries', 50)
+        self.num_free_queries = head_cfg.get('num_free_queries', 50)
+        self.sd_track_match_threshold = 0.05  # normalized coord threshold for SD-track dedup
         self.freeze_bev = freeze_bev # whether freeze bev related parameters
         self.freeze_bev_iters = freeze_bev_iters # whether freeze bev related parameters
         self.track_fp_aug = track_fp_aug
@@ -341,8 +347,128 @@ class MapTracker(BaseMapper):
         return all_history_curr2prev, all_history_prev2curr, all_history_coord
         
 
+    def filter_sd_priors_by_tracks(self, sd_priors_batch, track_query_info, device):
+        """Remove SD priors that overlap with existing track queries.
+
+        Args:
+            sd_priors_batch: list[dict] per batch item, each with polylines/labels/...
+            track_query_info: list[dict] or None
+            device: torch device
+
+        Returns:
+            filtered sd_priors_batch (list[dict])
+        """
+        if track_query_info is None:
+            return sd_priors_batch
+
+        filtered = []
+        for b_i, sd_priors in enumerate(sd_priors_batch):
+            if 'track_query_hs_embeds' not in track_query_info[b_i]:
+                filtered.append(sd_priors)
+                continue
+
+            track_boxes = track_query_info[b_i].get('trans_track_query_boxes', None)
+            track_labels = track_query_info[b_i].get('track_query_labels', None)
+
+            if track_boxes is None or len(track_boxes) == 0:
+                filtered.append(sd_priors)
+                continue
+
+            # track_boxes: [N_track, 40], sd polylines: [N_sd, 20, 2]
+            sd_polys = torch.tensor(sd_priors['polylines'], dtype=torch.float32, device=device)
+            sd_labels = torch.tensor(sd_priors['labels'], dtype=torch.long, device=device)
+            track_boxes_2d = track_boxes.view(-1, 20, 2)  # [N_track, 20, 2]
+
+            keep_mask = torch.ones(len(sd_polys), dtype=torch.bool, device=device)
+
+            for i in range(len(sd_polys)):
+                same_cls = (track_labels == sd_labels[i])
+                if not same_cls.any():
+                    continue
+                # Chamfer distance between sd_poly and each same-class track
+                sd_poly = sd_polys[i]  # [20, 2]
+                track_same = track_boxes_2d[same_cls]  # [M, 20, 2]
+                for j in range(len(track_same)):
+                    dist_mat = torch.cdist(sd_poly.unsqueeze(0), track_same[j].unsqueeze(0))[0]
+                    d12 = dist_mat.min(-1)[0].mean()
+                    d21 = dist_mat.min(-2)[0].mean()
+                    chamfer = (d12 + d21) / 2
+                    if chamfer < self.sd_track_match_threshold:
+                        keep_mask[i] = False
+                        break
+
+            keep_np = keep_mask.cpu().numpy()
+            filtered_priors = {
+                'polylines': sd_priors['polylines'][keep_np],
+                'labels': sd_priors['labels'][keep_np],
+                'attrs': sd_priors['attrs'][keep_np],
+                'has_tag_mask': sd_priors['has_tag_mask'][keep_np],
+                'reliability': sd_priors['reliability'][keep_np],
+            }
+            filtered.append(filtered_priors)
+
+        return filtered
+
+    def _augment_sd_priors(self, sd_priors):
+        """Apply SD prior augmentation during training.
+        - SD Prior Dropout: 15% chance to drop 30% of priors
+        - SD Polyline Jitter: always apply ±0.01 normalized noise (~0.6m)
+
+        Args:
+            sd_priors: dict with polylines [N, 20, 2], labels, attrs, has_tag_mask, reliability
+        Returns:
+            augmented sd_priors (dict)
+        """
+        N = len(sd_priors['polylines'])
+        if N == 0:
+            return sd_priors
+
+        # SD Prior Dropout: 15% chance, drop 30% of priors
+        if np.random.rand() < 0.15:
+            keep_mask = np.random.rand(N) > 0.3
+            if not keep_mask.any():
+                keep_mask[0] = True  # keep at least one
+            sd_priors = {
+                'polylines': sd_priors['polylines'][keep_mask],
+                'labels': sd_priors['labels'][keep_mask],
+                'attrs': sd_priors['attrs'][keep_mask],
+                'has_tag_mask': sd_priors['has_tag_mask'][keep_mask],
+                'reliability': sd_priors['reliability'][keep_mask],
+            }
+
+        # SD Polyline Jitter: always apply ±0.01 normalized noise
+        noise = np.random.uniform(-0.01, 0.01, size=sd_priors['polylines'].shape).astype(np.float32)
+        sd_priors['polylines'] = np.clip(sd_priors['polylines'] + noise, 0.0, 1.0)
+
+        return sd_priors
+
+    def build_sd_query_info(self, sd_priors_batch, device):
+        """Build SD query info from filtered SD priors.
+
+        Args:
+            sd_priors_batch: list[dict] per batch item
+            device: torch device
+
+        Returns:
+            sd_query_info: list[dict] per batch item
+        """
+        sd_query_info = []
+        for sd_priors in sd_priors_batch:
+            # Apply augmentation during training
+            if self.training:
+                sd_priors = self._augment_sd_priors(sd_priors)
+            sd_embed, sd_ref_pts, sd_reliability, sd_labels = \
+                self.head.build_sd_queries(sd_priors, device)
+            sd_query_info.append({
+                'sd_embed': sd_embed,
+                'sd_ref_pts': sd_ref_pts,
+                'sd_reliability': sd_reliability,
+                'sd_labels': sd_labels,
+            })
+        return sd_query_info
+
     def forward_train(self, img, vectors, semantic_mask, points=None, img_metas=None, all_prev_data=None,
-                      all_local2global_info=None, **kwargs):
+                      all_local2global_info=None, sd_priors=None, **kwargs):
         '''
         Args:
             img: torch.Tensor of shape [B, N, 3, H, W]
@@ -366,16 +492,18 @@ class MapTracker(BaseMapper):
         _use_memory = self.use_memory and self.num_iter > self.mem_warmup_iters
         
         if all_prev_data is not None:
-            num_prev_frames = len(all_prev_data)        
+            num_prev_frames = len(all_prev_data)
             all_gts_prev, all_img_prev, all_img_metas_prev, all_semantic_mask_prev  = [], [], [], []
+            all_sd_priors_prev = []
             for prev_data in all_prev_data:
                 gts_prev, img_prev, img_metas_prev, valid_idx_prev, _ = self.batch_data(
-                    prev_data['vectors'], prev_data['img'], prev_data['img_metas'], img.device      
+                    prev_data['vectors'], prev_data['img'], prev_data['img_metas'], img.device
                 )
                 all_gts_prev.append(gts_prev)
                 all_img_prev.append(img_prev)
                 all_img_metas_prev.append(img_metas_prev)
                 all_semantic_mask_prev.append(prev_data['semantic_mask'])
+                all_sd_priors_prev.append(prev_data.get('sd_priors', None))
         else:
             num_prev_frames = 0
 
@@ -467,17 +595,27 @@ class MapTracker(BaseMapper):
                     memory_bank = None
                 else:
                     memory_bank = self.memory_bank if _use_memory else None
+                # Build SD query info for prev frame
+                sd_query_info_t = None
+                if self.use_sd_queries and all_sd_priors_prev[t] is not None:
+                    prev_sd_priors = all_sd_priors_prev[t]
+                    if not isinstance(prev_sd_priors, list):
+                        prev_sd_priors = [prev_sd_priors[b_i] for b_i in range(bs)]
+                    filtered_sd = self.filter_sd_priors_by_tracks(prev_sd_priors, track_query_info, bev_feats.device)
+                    sd_query_info_t = self.build_sd_query_info(filtered_sd, bev_feats.device)
+
                 # 1). Compute the loss for prev frame
                 # 2). Get the matching results for computing the track query to next frame
                 loss_dict_prev, outputs_prev, prev_inds_list, prev_gt_inds_list, prev_matched_reg_cost, \
                     prev_gt_list = self.head(
-                                        bev_features=bev_feats, 
-                                        img_metas=img_metas_prev, 
+                                        bev_features=bev_feats,
+                                        img_metas=img_metas_prev,
                                         gts=gts_prev,
                                         track_query_info=track_query_info,
                                         memory_bank=memory_bank,
                                         return_loss=True,
-                                        return_matching=True)
+                                        return_matching=True,
+                                        sd_query_info=sd_query_info_t)
                 all_outputs_prev.append(outputs_prev)
 
                 if t > 0:
@@ -537,14 +675,23 @@ class MapTracker(BaseMapper):
         
         if not self.skip_vector_head:
             memory_bank = self.memory_bank if _use_memory else None
+
+            # Build SD query info for current frame
+            sd_query_info_curr = None
+            if self.use_sd_queries and sd_priors is not None:
+                curr_sd_priors = [sd_priors[b_i] for b_i in range(bs)]
+                filtered_sd = self.filter_sd_priors_by_tracks(curr_sd_priors, track_query_info, bev_feats.device)
+                sd_query_info_curr = self.build_sd_query_info(filtered_sd, bev_feats.device)
+
             # 3. run the head again and compute the loss for the second frame
             preds_list, loss_dict, det_match_idxs, det_match_gt_idxs, gt_list = self.head(
-                bev_features=bev_feats, 
-                img_metas=img_metas, 
+                bev_features=bev_feats,
+                img_metas=img_metas,
                 gts=gts,
                 track_query_info=track_query_info,
                 memory_bank=memory_bank,
-                return_loss=True)
+                return_loss=True,
+                sd_query_info=sd_query_info_curr)
         else:
             loss_dict = {}
         
@@ -584,7 +731,7 @@ class MapTracker(BaseMapper):
         return loss, log_vars, num_sample
 
     @torch.no_grad()
-    def forward_test(self, img, points=None, img_metas=None, seq_info=None, **kwargs):
+    def forward_test(self, img, points=None, img_metas=None, seq_info=None, sd_priors=None, **kwargs):
         '''
             inference pipeline
         '''
@@ -629,21 +776,35 @@ class MapTracker(BaseMapper):
                     all_history_prev2curr, self.use_memory, track_query_info=None)
             seg_preds, seg_feats = self.seg_decoder(bev_features=bev_feats, return_loss=False)
             if not self.skip_vector_head:
-                preds_list = self.head(bev_feats, img_metas=img_metas, return_loss=False)
+                # Build SD query info for first frame (no track queries to filter against)
+                sd_query_info = None
+                if self.use_sd_queries and sd_priors is not None:
+                    curr_sd = [sd_priors[0]] if isinstance(sd_priors, list) else [sd_priors]
+                    sd_query_info = self.build_sd_query_info(curr_sd, bev_feats.device)
+
+                preds_list = self.head(bev_feats, img_metas=img_metas, return_loss=False,
+                            sd_query_info=sd_query_info)
             track_dict = None
         else:
             # Using the saved prev-frame output to prepare the track query inputs
             track_query_info = self.head.get_track_info(scene_name, local_idx)
             # Transform prev-frame feature & pts to curr frame using the relative pose
-            self.temporal_propagate(bev_feats, img_metas, all_history_curr2prev, 
+            self.temporal_propagate(bev_feats, img_metas, all_history_curr2prev,
                 all_history_prev2curr, self.use_memory, track_query_info)
             seg_preds, seg_feats = self.seg_decoder(bev_features=bev_feats, return_loss=False)
 
+            # Build SD query info, filtering against existing track queries
+            sd_query_info = None
+            if self.use_sd_queries and sd_priors is not None:
+                curr_sd = [sd_priors[0]] if isinstance(sd_priors, list) else [sd_priors]
+                filtered_sd = self.filter_sd_priors_by_tracks(curr_sd, track_query_info, bev_feats.device)
+                sd_query_info = self.build_sd_query_info(filtered_sd, bev_feats.device)
+
             # Run the vector map decoder with instance-level memory
             memory_bank = self.memory_bank if self.use_memory else None
-            preds_list = self.head(bev_feats, img_metas=img_metas, 
+            preds_list = self.head(bev_feats, img_metas=img_metas,
                         track_query_info=track_query_info, memory_bank=memory_bank,
-                        return_loss=False)
+                        return_loss=False, sd_query_info=sd_query_info)
             track_dict = self._process_track_query_info(track_query_info)
             
         if not self.skip_vector_head:
@@ -832,10 +993,15 @@ class MapTracker(BaseMapper):
 
             target['track_query_match_ids'] = target_ind_matched_idx
             
-            if timestep == 0:
-                pad_bound = self.head.num_queries
+            if self.use_sd_queries:
+                newborn_budget = self.max_sd_queries + self.num_free_queries
             else:
-                pad_bound = self.tracked_query_length[b_i] + self.head.num_queries
+                newborn_budget = self.head.num_queries
+
+            if timestep == 0:
+                pad_bound = newborn_budget
+            else:
+                pad_bound = self.tracked_query_length[b_i] + newborn_budget
                 
             not_prev_out_ind = torch.arange(prev_out['lines'][b_i].shape[0]).to(device)
             not_prev_out_ind = torch.tensor([
@@ -890,12 +1056,12 @@ class MapTracker(BaseMapper):
 
             target['track_queries_mask'] = torch.cat([
                 track_queries_mask,
-                torch.tensor([False, ] * self.head.num_queries).to(device)
+                torch.tensor([False, ] * newborn_budget).to(device)
             ]).bool()
 
             target['track_queries_fal_pos_mask'] = torch.cat([
                 track_queries_fal_pos_mask,
-                torch.tensor([False, ] * self.head.num_queries).to(device)
+                torch.tensor([False, ] * newborn_budget).to(device)
             ]).bool()
 
             if use_memory:
@@ -920,7 +1086,10 @@ class MapTracker(BaseMapper):
             target['pad_hs_embeds'] = pad_hs_embeds
             target['pad_query_boxes'] = pad_query_boxes
             target['query_padding_mask'] = query_padding_mask
-            self.tracked_query_length[b_i] = lengths[b_i] - self.head.num_queries
+            if self.use_sd_queries:
+                self.tracked_query_length[b_i] = lengths[b_i] - (self.max_sd_queries + self.num_free_queries)
+            else:
+                self.tracked_query_length[b_i] = lengths[b_i] - self.head.num_queries
         return targets
         
     def train(self, *args, **kwargs):
