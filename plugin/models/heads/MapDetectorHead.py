@@ -648,9 +648,9 @@ class MapDetectorHead(nn.Module):
                            gt_labels,
                            gt_lines,
                            track_info=None,
-                           gt_bboxes_ignore=None,
                            query_meta=None,
-                           sd_init_lines=None):
+                           sd_init_lines=None,
+                           gt_bboxes_ignore=None):
         """
             Compute regression and classification targets for one image.
             Outputs from a single decoder layer of a single feature level are used.
@@ -704,9 +704,13 @@ class MapDetectorHead(nn.Module):
         labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
         label_weights = gt_lines.new_ones(num_pred_lines) # (num_q, )
 
-        # SD negative down-weighting
+        # SD padding queries (query_type==3) should not contribute to loss
         if query_meta is not None:
-            sd_mask = (query_meta['query_type'] == 1)  # SD queries
+            sd_pad_mask = (query_meta['query_type'] == 3)  # SD padding
+            label_weights[sd_pad_mask] = 0.0
+
+            # SD negative down-weighting for real SD queries
+            sd_mask = (query_meta['query_type'] == 1)  # real SD queries
             neg_mask = (labels == self.num_classes)  # background
             sd_neg_mask = sd_mask & neg_mask
             if sd_neg_mask.any():
@@ -792,8 +796,8 @@ class MapDetectorHead(nn.Module):
         lines_targets_list, lines_weights_list,
         pos_inds_list, neg_inds_list,pos_gt_inds_list, matched_reg_cost) = multi_apply(
             self._get_target_single, preds['scores'], lines_pred,
-            gt_labels, gt_lines, track_info, gt_bboxes_ignore=gt_bboxes_ignore_list,
-            query_meta=query_meta, sd_init_lines=sd_init_lines_list)
+            gt_labels, gt_lines, track_info, query_meta, sd_init_lines_list,
+            gt_bboxes_ignore=gt_bboxes_ignore_list)
         
         num_total_pos = sum((inds.numel() for inds in pos_inds_list))
         num_total_neg = sum((inds.numel() for inds in neg_inds_list))
@@ -803,6 +807,11 @@ class MapDetectorHead(nn.Module):
             padding_mask = torch.cat([t['query_padding_mask'] for t in track_info], dim=0)
             num_padding = padding_mask.sum()
             num_total_neg -= num_padding
+
+        # Also remove SD padding queries from neg counting
+        if query_meta[0] is not None:
+            sd_pad_count = sum((m['query_type'] == 3).sum().item() for m in query_meta)
+            num_total_neg -= sd_pad_count
         
         new_gts = dict(
             labels=labels_list, # list[Tensor(num_q, )], length=bs
@@ -966,9 +975,10 @@ class MapDetectorHead(nn.Module):
                 qt = query_meta[i]['query_type']
                 tmp_prop_flags = (qt == 0)  # track=0 → prop=True, sd/free/pad → False
             else:
+                num_det = self.num_free_queries if self.use_sd_queries else self.num_queries
                 tmp_prop_flags = torch.zeros(tmp_vectors.shape[0]).bool()
-                tmp_prop_flags[-self.num_queries:] = 0
-                tmp_prop_flags[:-self.num_queries] = 1
+                tmp_prop_flags[-num_det:] = 0
+                tmp_prop_flags[:-num_det] = 1
             num_preds, num_points2 = tmp_vectors.shape
             tmp_vectors = tmp_vectors.view(num_preds, num_points2//2, 2)
 
@@ -1105,8 +1115,11 @@ class MapDetectorHead(nn.Module):
                 # Exclude padding queries
                 pos = pos & (qt != 3)
             else:
-                pos_track = tmp_scores[:-self.num_queries] > thr_track
-                pos_det = tmp_scores[-self.num_queries:] > thr_det
+                # When use_sd_queries is True but sd_priors is None (no query_meta),
+                # the query layout is [track, free] with num_free_queries det slots.
+                num_det = self.num_free_queries if self.use_sd_queries else self.num_queries
+                pos_track = tmp_scores[:-num_det] > thr_track
+                pos_det = tmp_scores[-num_det:] > thr_det
                 pos = torch.cat([pos_track, pos_det], dim=0)
         else:
             raise RuntimeError('The experiment uses sigmoid for cls outputs')

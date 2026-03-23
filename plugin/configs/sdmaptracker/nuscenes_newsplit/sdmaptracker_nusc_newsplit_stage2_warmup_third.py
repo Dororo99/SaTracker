@@ -5,7 +5,7 @@ _base_ = ['./sdmaptracker_nusc_newsplit_stage2_warmup.py']
 # ============================================================================
 
 num_gpus = 4
-batch_size = 4  # reduced from 8 due to OOM with SD queries (100→150 queries)
+batch_size = 8
 num_iters_per_epoch = 9274 // (num_gpus * batch_size)  # 1/3 dataset: 9274 samples
 num_epochs = 4
 num_epochs_interval = num_epochs
@@ -14,7 +14,7 @@ total_iters = num_epochs * num_iters_per_epoch
 # Override dataset to use 1/3 split
 data = dict(
     samples_per_gpu=batch_size,
-    workers_per_gpu=4,  # reduced from 10 to save RAM (each worker loads SD cache)
+    # workers_per_gpu=4,  # reduced from 10 to save RAM (each worker loads SD cache)
     train=dict(
         ann_file='./datasets/nuscenes/nuscenes_map_infos_train_newsplit_third.pkl',
         sd_prior_cache_path='./datasets/nuscenes/sd_prior_cache_train_newsplit.pkl',

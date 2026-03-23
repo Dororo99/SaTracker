@@ -97,7 +97,7 @@ Temporal:       L1 propagation loss (weight=0.1, forward + backward)
 | Stage | 내용 | Backbone | Vector Head | Memory | Epochs |
 |-------|------|----------|-------------|--------|--------|
 | **Stage 1** | BEV pretrain | 학습 | skip (seg만) | off | 18 |
-| **Stage 2** | Vector warmup | freeze | 학습 | off (warmup 500 iter 후 on) | 24 |
+| **Stage 2** | Vector warmup | freeze | 학습 | off (warmup 500 iter 후 on) | 4 |
 | **Stage 3** | Joint finetune | 학습 | 학습 | on | 36 |
 
 ---
@@ -109,12 +109,15 @@ Temporal:       L1 propagation loss (weight=0.1, forward + backward)
 ```
 기존 MapTracker                      SDMapTracker
 ─────────────────                    ─────────────────
-Query = [track, dummy(100), pad]  →  Query = [track, sd_anchor(≤50), free(50), pad]
-dummy = learnable embedding       →  sd_anchor = SD map prior에서 생성
-                                     free = learnable embedding (기존 dummy 축소)
+Query = [track, dummy(100), pad]  →  Query = [track, sd_anchor(≤25), free(100), pad]
+dummy = learnable embedding       →  sd_anchor = SD map prior에서 생성 (순수 추가)
+                                     free = learnable embedding (기존 100개 유지)
 ref_pts = learned linear          →  sd_ref = SD prior polyline 좌표 그대로
                                      free_ref = learned linear (기존과 동일)
 ```
+
+**설계 원칙:** SD query는 기존 query를 대체하지 않고 순수하게 추가.
+Free query 100개를 유지하여 기존 MapTracker 대비 detection capacity 손실 없음.
 
 **변경되지 않는 것:**
 - BEVFormerBackbone 전체
@@ -155,9 +158,9 @@ mask  = [track_mask,     False(100),          True(pad)]
 
 **변경 후:**
 ```
-query = [track_embeds,   sd_embeds(≤50),      free_embeds(50),     pad_embeds]
+query = [track_embeds,   sd_embeds(≤25),      free_embeds(100),    pad_embeds]
 ref   = [track_ref,      sd_prior_polyline,   free_ref,            pad_ref]
-mask  = [track_mask,     sd_pad_mask,         False(50),           True(pad)]
+mask  = [track_mask,     sd_pad_mask,         False(100),          True(pad)]
 
 + query_meta = {
     num_track, num_sd, num_free,
@@ -166,13 +169,15 @@ mask  = [track_mask,     sd_pad_mask,         False(50),           True(pad)]
   }
 ```
 
+**SD padding (query_type==3) 처리:** loss에서 완전 제외 (label_weight=0, num_total_neg 미포함)
+
 **각 query type의 초기화 비교:**
 
 | | embedding | reference point | 역할 |
 |---|---|---|---|
 | **track** (기존) | 이전 frame hs_embeds + MotionMLP | 이전 frame lines + pose transform | 이미 추적 중인 instance |
 | **sd_anchor** (신규) | sd_query_encoder(polyline+attrs+reliability) | **SD prior polyline 좌표 그대로** | 새로 보이는 도로 (SD map 기반) |
-| **free** (기존 dummy 축소) | learnable embedding (100→50개) | learned linear → sigmoid | SD map에 없는 도로 대비 |
+| **free** (기존 dummy 유지) | learnable embedding (100개, 기존과 동일) | learned linear → sigmoid | SD map에 없는 도로 대비 |
 
 ### 2.4 SD-Track 매칭 (Head 호출 직전)
 
@@ -249,8 +254,8 @@ SD Polyline Jitter: 항상, ±0.01 normalized noise (≈0.6m)
 
 | 위치 | 기존 | 변경 |
 |------|------|------|
-| `_batchify_tracks` | `tracked_len = lengths - num_queries` | `tracked_len = lengths - (num_sd + num_free)` |
-| `prepare_track_queries_and_targets` | `pad_bound = tracked + num_queries` | `pad_bound = tracked + num_sd + num_free` |
+| `_batchify_tracks` | `tracked_len = lengths - num_queries` | `tracked_len = lengths - (max_sd + num_free)` |
+| `prepare_track_queries_and_targets` | `pad_bound = tracked + num_queries` | `pad_bound = tracked + max_sd + num_free` |
 | `post_process` | `props[-100:] = 0` | `query_type != 0` |
 | `prepare_temporal_propagation` | `scores[:-100]` = track | `query_type == 0` = track |
 
@@ -302,7 +307,7 @@ Loss: seg_focal(10.0) + seg_dice(1.0)
 BEV backbone: freeze
 Memory: off → warmup 후 on (mem_warmup_iters=500)
 
-Query layout: [sd_anchor(≤50), free(50)]  (track 없음, single-frame이므로)
+Query layout: [sd_anchor(≤25), free(100)]  (track 없음, single-frame이므로)
 SD prior dropout/jitter 적용
 
 학습 대상: sd_query_encoder, cls_branches, reg_branches, transformer decoder
@@ -310,14 +315,14 @@ SD prior dropout/jitter 적용
 
 | 항목 | 값 |
 |------|---|
-| Epochs | 24 |
+| Epochs | 4 |
 | Backbone | **freeze** |
 | Vector Head | 학습 |
 | SD Query | **활성** |
 | Memory | off → on (500 iter 후) |
 | Load from | Stage 1 checkpoint (`strict=False`) |
 | 새 모듈 초기화 | sd_query_encoder: random init |
-| | query_embedding: (100,512) → (50,512) shape 불일치 → 재초기화 |
+| | query_embedding: (100,512) shape 일치 → 기존 weight 사용 가능 |
 
 ### Stage 3: Joint Finetune (변경)
 
@@ -326,7 +331,7 @@ SD prior dropout/jitter 적용
 Multi-frame (5 frames, span 10)
 Memory: on
 
-Query layout: [track(가변), sd_anchor(≤50), free(50), pad]
+Query layout: [track(가변), sd_anchor(≤25), free(100), pad]
 SD-Track 매칭 + SDPriorCost + neg down-weight 전부 활성
 SD prior dropout/jitter 적용
 Temporal propagation loss 활성
@@ -363,7 +368,7 @@ Load       ImageNet          Stage 1               Stage 2
          │ BEV만    │    │ SD+Vec   │    │ 전체     │
          │ 학습     │    │ 학습     │    │ 학습     │
          └──────────┘    └──────────┘    └──────────┘
-              18ep            24ep            36ep
+              18ep            4ep             36ep
 ```
 
 ---
@@ -382,12 +387,12 @@ Images [B,6,3,480,800] → BEVFormer → BEV [B,256,50,100]
                      MapSegHead     SD Prior Cache 로드
                      → seg loss     → sd_query_encoder
                                     → sd_embed [B,≤50,512]
-                                      sd_ref [B,≤50,20,2]
+                                      sd_ref [B,≤25,20,2]
                                           │
-                          free_embed [B,50,512] (learnable)
-                          free_ref [B,50,20,2]  (learned linear)
+                          free_embed [B,100,512] (learnable)
+                          free_ref [B,100,20,2]  (learned linear)
                                           │
-                     Q = [sd(≤50), free(50)]   ← 첫 프레임: track 없음
+                     Q = [sd(≤25), free(100)]   ← 첫 프레임: track 없음
                                           │
                      Decoder 6 layers ────┤
                      (self-attn, BEV cross-attn, FFN)
@@ -419,7 +424,7 @@ Images → BEVFormer (+ history BEV warping) → BEV [B,256,50,100]
                                              SD-Track 매칭 (중복 제거)
                                              → sd_query_encoder
                                                    │
-                     Q = [track(가변), sd_anchor(가변), free(50), pad]
+                     Q = [track(가변), sd_anchor(가변), free(100), pad]
                          query_meta: {type, reliability}
                                                    │
                      Decoder 6 layers ─────────────┤
@@ -433,6 +438,7 @@ Images → BEVFormer (+ history BEV warping) → BEV [B,256,50,100]
                      free: cls + reg               │
                                                    │
                      Loss: cls + reg ──────────────┤
+                     (SD pad excluded from loss)   │
                      (SD neg down-weight)          │
                                                    │
                      Memory Bank update

@@ -9,8 +9,9 @@ _base_ = ['../../maptracker/nuscenes_newsplit/maptracker_nusc_newsplit_5frame_sp
 # ============================================================================
 
 # SD map query settings
-num_free_queries = 50
-max_sd_queries = 50
+# free queries = 100 (same as original MapTracker), SD queries are purely additive
+num_free_queries = 100
+max_sd_queries = 25  # avg 14/sample, max 56 → 25 covers most cases with minimal padding
 
 model = dict(
     head_cfg=dict(

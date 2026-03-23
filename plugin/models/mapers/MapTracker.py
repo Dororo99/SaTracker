@@ -251,7 +251,7 @@ class MapTracker(BaseMapper):
                     trans_cls_loss += trans_score
 
                     # backward trans loss
-                    pose_matrix_inv = torch.inverse(trans_matrix).float()[:3]
+                    pose_matrix_inv = torch.inverse(trans_matrix.cpu()).float().to(trans_matrix.device)[:3]
                     rot_mat_inv = pose_matrix_inv[:, :3].cpu().numpy()
 
                     rot_inv = R.from_matrix(rot_mat_inv)

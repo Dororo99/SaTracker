@@ -385,6 +385,12 @@ class SDPriorCost(object):
             cost (Tensor): [num_query, num_gt] - additive cost (lower = better match)
         """
         num_q = len(sd_init_lines)
+
+        # gt_lines may be [num_gt, 2*num_points] or [num_gt, num_permute, 2*num_points]
+        # Use first permutation (original order) if permuted
+        if gt_lines.dim() == 3:
+            gt_lines = gt_lines[:, 0, :]  # [num_gt, 2*num_points]
+
         num_gt = len(gt_lines)
 
         if num_q == 0 or num_gt == 0:
