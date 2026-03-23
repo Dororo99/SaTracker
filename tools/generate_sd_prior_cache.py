@@ -102,9 +102,13 @@ def parse_osm_file(filepath):
                 tags,
             )
         elif elem.tag == 'way':
+            wid = int(elem.attrib['id'])
             nids = [int(nd.attrib['ref']) for nd in elem.findall('nd')]
             tags = {t.attrib['k']: t.attrib['v'] for t in elem.findall('tag')}
-            ways[int(elem.attrib['id'])] = OSMWay(int(elem.attrib['id']), nids, tags)
+            if wid in ways and ways[wid].tags and not tags:
+                # Keep existing entry if it has tags and new one doesn't
+                continue
+            ways[wid] = OSMWay(wid, nids, tags)
     return nodes, ways
 
 
@@ -142,7 +146,9 @@ def load_city_osm(city_name, osm_root):
     Returns dict with 'vehicle_ways' and 'crossing_ways', each value being
     a dict  wid -> {coords, tags, line}.
     """
-    cache_file = os.path.join(osm_root, f'{city_name}_roads.osm')
+    cache_file = os.path.join(osm_root, f'{city_name}.osm')
+    if not os.path.exists(cache_file):
+        cache_file = os.path.join(osm_root, f'{city_name}_roads.osm')
     if not os.path.exists(cache_file):
         raise FileNotFoundError(f'OSM cache not found: {cache_file}')
     nodes, ways = parse_osm_file(cache_file)
@@ -453,7 +459,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Generate SD map prior cache for nuScenes')
     parser.add_argument('--data-root', type=str, default='datasets/nuscenes',
                         help='Path to datasets/nuscenes')
-    parser.add_argument('--osm-root', type=str, default='/home/kyungmin/min_ws/mapping',
+    parser.add_argument('--osm-root', type=str, default='datasets/nuscenes/osm_tile_cache',
                         help='Path to OSM cache directory')
     parser.add_argument('--split', type=str, required=True, choices=['train', 'val'],
                         help='Dataset split')
