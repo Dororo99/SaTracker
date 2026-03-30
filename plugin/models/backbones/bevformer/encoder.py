@@ -14,6 +14,7 @@ from mmcv.runner import force_fp32, auto_fp16
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 from mmcv.utils import TORCH_VERSION, digit_version
 from mmcv.utils import ext_loader
 
@@ -36,6 +37,7 @@ class BEVFormerEncoder(TransformerLayerSequence):
     """
 
     def __init__(self, *args, pc_range=None, num_points_in_pillar=4, return_intermediate=False, dataset_type='nuscenes',
+                 use_osm_tile=False, osm_tile_embed_dims=None,
                  **kwargs):
 
         super(BEVFormerEncoder, self).__init__(*args, **kwargs)
@@ -46,6 +48,18 @@ class BEVFormerEncoder(TransformerLayerSequence):
             mem_conv = TemporalNet(history_steps=4, hidden_dims=self.embed_dims, num_blocks=1)
             temporal_mem_layers.append(mem_conv)
         self.temporal_mem_layers = nn.ModuleList(temporal_mem_layers)
+
+        # OSM tile cross-attention layers (between Perspective-to-BEV CA and Memory Fusion)
+        self.use_osm_tile = use_osm_tile
+        if use_osm_tile:
+            from plugin.models.modules.osm_tile_encoder import TileBEVFusion
+            _dims = osm_tile_embed_dims or self.embed_dims
+            tile_ca_layers = []
+            for _ in range(self.num_layers):
+                tile_ca = TileBEVFusion(embed_dims=_dims)
+                tile_ca.init_weights()
+                tile_ca_layers.append(tile_ca)
+            self.tile_ca_layers = nn.ModuleList(tile_ca_layers)
 
         self.num_points_in_pillar = num_points_in_pillar
         self.pc_range = pc_range
@@ -168,6 +182,8 @@ class BEVFormerEncoder(TransformerLayerSequence):
                 prev_bev=None,
                 shift=0.,
                 warped_history_bev=None,
+                tile_feat=None,
+                tile_active=False,
                 **kwargs):
         """Forward function for `TransformerDecoder`.
         Args:
@@ -237,7 +253,16 @@ class BEVFormerEncoder(TransformerLayerSequence):
                 prev_bev=prev_bev,
                 warped_history_bev=warped_history_bev,
                 **kwargs)
-            
+
+            # OSM tile cross-attention (between Perspective-to-BEV CA and Memory Fusion)
+            # tile_active is controlled by MapTracker based on runner's num_iter
+            if tile_active and tile_feat is not None:
+                bev_spatial = rearrange(output, 'b (h w) c -> b c h w', h=bev_h)
+                bev_spatial = torch.utils.checkpoint.checkpoint(
+                    self.tile_ca_layers[lid], bev_spatial, tile_feat,
+                    use_reentrant=False)
+                output = rearrange(bev_spatial, 'b c h w -> b (h w) c')
+
             # BEV memory fusion layer
             mem_layer = self.temporal_mem_layers[lid]
             curr_feat = rearrange(output, 'b (h w) c -> b c h w', h=warped_history_bev.shape[3])

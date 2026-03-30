@@ -30,13 +30,14 @@ class MapTransformerDecoder_new(BaseModule):
             `LN`.
     """
 
-    def __init__(self, 
-                 transformerlayers=None, 
-                 num_layers=None, 
+    def __init__(self,
+                 transformerlayers=None,
+                 num_layers=None,
                  prop_add_stage=0,
                  return_intermediate=True,
+                 use_sd_prior=False,
                  init_cfg=None):
-        
+
         super().__init__(init_cfg)
         if isinstance(transformerlayers, dict):
             transformerlayers = [
@@ -55,6 +56,15 @@ class MapTransformerDecoder_new(BaseModule):
         self.prop_add_stage = prop_add_stage
         assert prop_add_stage >= 0  and prop_add_stage < num_layers
 
+        # SD prior: shared positional encoding MLP (like BEV PE, shared across layers)
+        self.use_sd_prior = use_sd_prior
+        if use_sd_prior:
+            self.sd_pos_proj = nn.Sequential(
+                nn.Linear(2, self.embed_dims),
+                nn.ReLU(),
+                nn.Linear(self.embed_dims, self.embed_dims),
+            )
+
     def forward(self,
                 query,
                 key,
@@ -69,6 +79,9 @@ class MapTransformerDecoder_new(BaseModule):
                 cls_branches,
                 predict_refine,
                 memory_bank=None,
+                sd_features=None,
+                sd_key_padding_mask=None,
+                sd_coords=None,
                 **kwargs):
         """Forward function for `TransformerDecoder`.
         Args:
@@ -76,13 +89,9 @@ class MapTransformerDecoder_new(BaseModule):
                 `(num_query, bs, embed_dims)`.
             reference_points (Tensor): The reference
                 points of offset. has shape (bs, num_query, num_points, 2).
-            valid_ratios (Tensor): The radios of valid
-                points on the feature map, has shape
-                (bs, num_levels, 2)
-            reg_branch: (obj:`nn.ModuleList`): Used for
-                refining the regression results. Only would
-                be passed when with_box_refine is True,
-                otherwise would be passed a `None`.
+            sd_features (Tensor): SD prior features [B, max_sd_tokens, D].
+            sd_key_padding_mask (Tensor): [B, max_sd_tokens], True=padding.
+            sd_coords (Tensor): [B, max_sd_tokens, 2], per-point [0,1] coords.
         Returns:
             Tensor: Results with shape [1, num_query, bs, embed_dims] when
                 return_intermediate is `False`, otherwise it has shape
@@ -92,6 +101,11 @@ class MapTransformerDecoder_new(BaseModule):
         output = query
         intermediate = []
         intermediate_reference_points = []
+
+        # Pre-compute SD key positional encoding (shared across layers)
+        sd_key_pos = None
+        if self.use_sd_prior and sd_coords is not None:
+            sd_key_pos = self.sd_pos_proj(sd_coords)  # [B, max_sd_tokens, D]
 
         for lid, layer in enumerate(self.layers):
             tmp = reference_points.clone()
@@ -108,6 +122,12 @@ class MapTransformerDecoder_new(BaseModule):
                 level_start_index=level_start_index,
                 query_key_padding_mask=query_key_padding_mask,
                 memory_bank=memory_bank,
+                sd_features=sd_features,
+                sd_key_padding_mask=sd_key_padding_mask,
+                # SD prior: original ref_points (before y-flip) + precomputed key PE
+                reference_points_orig=reference_points,
+                sd_key_pos=sd_key_pos,
+                sd_pos_proj=self.sd_pos_proj if self.use_sd_prior else None,
                 **kwargs)
             
             reg_points = reg_branches[lid](output.permute(1, 0, 2)) # (bs, num_q, 2*num_points)
@@ -184,6 +204,8 @@ class MapTransformerLayer(BaseTransformerLayer):
                  norm_cfg=dict(type='LN'),
                  init_cfg=None,
                  batch_first=False,
+                 use_sd_cross_attn=False,
+                 sd_cross_attn_cfg=None,
                  **kwargs):
 
         super().__init__(
@@ -196,6 +218,22 @@ class MapTransformerLayer(BaseTransformerLayer):
             **kwargs
         )
 
+        # SD Cross-Attention: inserted after self_attn, before BEV cross_attn (Option C)
+        self.use_sd_cross_attn = use_sd_cross_attn
+        if use_sd_cross_attn:
+            if sd_cross_attn_cfg is None:
+                embed_dims = self.embed_dims
+                sd_cross_attn_cfg = dict(
+                    type='MultiheadAttention',
+                    embed_dims=embed_dims,
+                    num_heads=8,
+                    attn_drop=0.1,
+                    proj_drop=0.1,
+                )
+            from mmcv.cnn.bricks.transformer import build_attention
+            self.sd_cross_attn = build_attention(sd_cross_attn_cfg)
+            self.sd_cross_attn_norm = build_norm_layer(norm_cfg, self.embed_dims)[1]
+
     def forward(self,
                 query,
                 key=None,
@@ -207,6 +245,11 @@ class MapTransformerLayer(BaseTransformerLayer):
                 query_key_padding_mask=None,
                 key_padding_mask=None,
                 memory_bank=None,
+                sd_features=None,
+                sd_key_padding_mask=None,
+                reference_points_orig=None,
+                sd_key_pos=None,
+                sd_pos_proj=None,
                 **kwargs):
         """Forward function for `TransformerDecoderLayer`.
 
@@ -269,7 +312,7 @@ class MapTransformerLayer(BaseTransformerLayer):
                     temp_key = temp_value = query
                 else:
                     temp_key = temp_value = torch.cat([memory_query, query], dim=0)
-                
+
                 query = self.attentions[attn_index](
                     query,
                     temp_key,
@@ -300,6 +343,33 @@ class MapTransformerLayer(BaseTransformerLayer):
                         key_padding_mask=key_padding_mask,
                         **kwargs)
                     attn_index += 1
+
+                    # SD cross-attention: after BEV, before memory
+                    # Uses per-point coords for key_pos, original (non-flipped) ref_points for query_pos
+                    if self.use_sd_cross_attn and sd_features is not None and sd_pos_proj is not None:
+                        # Skip if ALL tokens are padding (would cause NaN in softmax)
+                        _has_valid_sd = sd_key_padding_mask is None or not sd_key_padding_mask.all()
+
+                        if _has_valid_sd:
+                            # Query pos: original ref_points mean → shared sd_pos_proj
+                            ref_mean = reference_points_orig.mean(dim=2)  # [B, num_q, 2]
+                            q_pos = sd_pos_proj(ref_mean).permute(1, 0, 2)  # [num_q, B, D]
+                            # Key pos: precomputed from sd_coords via shared sd_pos_proj
+                            k_pos = sd_key_pos.permute(1, 0, 2)  # [max_sd_tokens, B, D]
+
+                            sd_feats_t = sd_features.permute(1, 0, 2)  # [max_sd_tokens, B, D]
+                            query_sd = self.sd_cross_attn(
+                                query_bev,
+                                sd_feats_t,
+                                sd_feats_t,
+                                identity=None,
+                                query_pos=q_pos,
+                                key_pos=k_pos,
+                                attn_mask=None,
+                                key_padding_mask=sd_key_padding_mask,
+                            )
+                            query_bev = self.sd_cross_attn_norm(query_bev + query_sd)
+
                 else:
                     # Memory cross attention
                     assert attn_index == 2
@@ -463,6 +533,11 @@ class MapTransformer(Transformer):
         if memory_query is not None:
             memory_query = memory_query.permute(1, 0, 2)
 
+        # Extract SD features from kwargs if present
+        sd_features = kwargs.pop('sd_features', None)
+        sd_key_padding_mask = kwargs.pop('sd_key_padding_mask', None)
+        sd_coords = kwargs.pop('sd_coords', None)
+
         inter_states, inter_references = self.decoder(
             query=query,
             key=None,
@@ -476,6 +551,9 @@ class MapTransformer(Transformer):
             cls_branches=cls_branches,
             memory_query=memory_query,
             memory_bank=memory_bank,
+            sd_features=sd_features,
+            sd_key_padding_mask=sd_key_padding_mask,
+            sd_coords=sd_coords,
             **kwargs)
         
         return inter_states, init_reference_points, inter_references

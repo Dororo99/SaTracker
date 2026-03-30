@@ -69,12 +69,23 @@ class FormatBundleMap(object):
             vectors = results['vectors']
             results['vectors'] = DC(vectors, stack=False, cpu_only=True)
 
+        if 'osm_tile' in results:
+            tile = results['osm_tile']
+            tile = np.ascontiguousarray(tile.transpose(2, 0, 1))  # HWC → CHW
+            results['osm_tile'] = DC(to_tensor(tile), stack=True)
+
         if 'sd_priors' in results:
             results['sd_priors'] = DC(results['sd_priors'], stack=False, cpu_only=True)
 
         if 'polys' in results:
             results['polys'] = DC(results['polys'], stack=False, cpu_only=True)
-        
+
+        if 'sat_img' in results:
+            sat = results['sat_img']
+            if isinstance(sat, np.ndarray):
+                sat = np.ascontiguousarray(sat)  # already CHW from loader
+                results['sat_img'] = DC(to_tensor(sat), stack=True)
+
         return results
 
     def __repr__(self):

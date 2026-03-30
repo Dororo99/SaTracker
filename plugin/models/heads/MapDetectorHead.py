@@ -1,8 +1,101 @@
 import copy
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mmcv.cnn import Conv2d, Linear, build_activation_layer, bias_init_with_prob, xavier_init
+
+
+class SDQueryEncoder(nn.Module):
+    """Dual-branch SD query encoder: geometric (Conv1d) + semantic (MLP).
+
+    Geometric branch uses 1D convolutions with positional encoding to capture
+    polyline spatial structure (point order, curvature, direction).
+    Semantic branch encodes SD-map-unique attributes (lanes, width, has_tag,
+    reliability) with proper normalization and equal representation capacity.
+
+    Args:
+        num_points (int): Number of polyline points (default 20).
+        embed_dims (int): Output embedding dimension (default 512).
+        lanes_max (float): Max lanes value for normalization.
+        width_max (float): Max width value for normalization.
+    """
+
+    def __init__(self, num_points=20, embed_dims=512, lanes_max=14.0, width_max=14.0):
+        super().__init__()
+        self.num_points = num_points
+        self.embed_dims = embed_dims
+        self.lanes_max = lanes_max
+        self.width_max = width_max
+        geo_dim = embed_dims // 2   # 256
+        sem_dim = embed_dims // 2   # 256
+
+        # --- Geometric branch: Conv1d over polyline points ---
+        pos_enc_dim = 32
+        self.point_pos_embed = nn.Embedding(num_points, pos_enc_dim)
+        # input per point: 2 (xy) + 32 (pos) = 34
+        self.geo_conv1 = nn.Conv1d(2 + pos_enc_dim, 128, kernel_size=3, padding=1)
+        self.geo_conv2 = nn.Conv1d(128, geo_dim, kernel_size=3, padding=1)
+        self.geo_pool = nn.AdaptiveAvgPool1d(1)
+        self.geo_proj = nn.Linear(geo_dim, geo_dim)
+
+        # --- Semantic branch: lanes, width, oneway, highway_class, has_tag, reliability ---
+        # lanes(1) + width(1) + oneway(1) + highway_class(1) + has_tag(2) + reliability(1) = 7
+        sem_input_dim = 7
+        self.sem_encoder = nn.Sequential(
+            nn.Linear(sem_input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, sem_dim),
+        )
+
+        # --- Fusion ---
+        self.fusion = nn.Sequential(
+            nn.Linear(embed_dims, embed_dims),
+            nn.ReLU(),
+            nn.Linear(embed_dims, embed_dims),
+        )
+
+    def forward(self, polylines, attrs, has_tag, reliability):
+        """
+        Args:
+            polylines: [N, num_points, 2] normalized polyline coords
+            attrs: [N, 4] — lanes, width, oneway, highway_class
+            has_tag: [N, 2] — has_lanes_tag, has_width_tag
+            reliability: [N] — overall reliability score
+
+        Returns:
+            sd_embed: [N, embed_dims]
+        """
+        N = polylines.shape[0]
+        device = polylines.device
+
+        # --- Geometric branch ---
+        pos_idx = torch.arange(self.num_points, device=device)
+        pos_enc = self.point_pos_embed(pos_idx)  # [num_points, 32]
+        pos_enc = pos_enc.unsqueeze(0).expand(N, -1, -1)  # [N, num_points, 32]
+
+        geo_input = torch.cat([polylines, pos_enc], dim=-1)  # [N, num_points, 34]
+        geo_input = geo_input.permute(0, 2, 1)  # [N, 34, num_points]
+        geo = F.relu(self.geo_conv1(geo_input))  # [N, 128, num_points]
+        geo = F.relu(self.geo_conv2(geo))        # [N, 256, num_points]
+        geo = self.geo_pool(geo).squeeze(-1)     # [N, 256]
+        geo = self.geo_proj(geo)                 # [N, 256]
+
+        # --- Semantic branch ---
+        lanes_norm = attrs[:, 0:1] / self.lanes_max      # [N, 1]
+        width_norm = attrs[:, 1:2] / self.width_max      # [N, 1]
+        oneway = attrs[:, 2:3]                            # [N, 1], already 0/1
+        hw_class_norm = attrs[:, 3:4] / 11.0             # [N, 1], 0~11 → 0~1
+        sem_input = torch.cat([
+            lanes_norm, width_norm, oneway, hw_class_norm,
+            has_tag,                                      # [N, 2]
+            reliability.unsqueeze(-1),                    # [N, 1]
+        ], dim=-1)  # [N, 7]
+        sem = self.sem_encoder(sem_input)  # [N, 256]
+
+        # --- Fusion ---
+        fused = self.fusion(torch.cat([geo, sem], dim=-1))  # [N, 512]
+        return fused
 from mmcv.runner import force_fp32
 from mmcv.cnn.bricks.transformer import build_positional_encoding
 from mmdet.models.utils import build_transformer
@@ -134,11 +227,9 @@ class MapDetectorHead(nn.Module):
         if self.use_sd_queries:
             self.query_embedding = nn.Embedding(self.num_free_queries, self.embed_dims)
             self.reference_points_embed = nn.Linear(self.embed_dims, self.num_points * 2)
-            sd_input_dim = self.num_points * 2 + self.sd_attr_dim + self.sd_tag_dim + 1  # +1 for reliability
-            self.sd_query_encoder = nn.Sequential(
-                nn.Linear(sd_input_dim, self.embed_dims),
-                nn.ReLU(),
-                nn.Linear(self.embed_dims, self.embed_dims),
+            self.sd_query_encoder = SDQueryEncoder(
+                num_points=self.num_points,
+                embed_dims=self.embed_dims,
             )
         else:
             self.query_embedding = nn.Embedding(self.num_queries, self.embed_dims)
@@ -249,15 +340,14 @@ class MapDetectorHead(nn.Module):
             reliability = reliability[keep_indices]
             labels = labels[keep_indices]
 
-        # Encode: concat polyline + attrs + has_tag + reliability
-        poly_flat = polylines.flatten(1)  # [N, 40]
-        sd_input = torch.cat([poly_flat, attrs, has_tag, reliability.unsqueeze(-1)], dim=-1)
-        sd_embed = self.sd_query_encoder(sd_input)  # [N, embed_dims]
+        # Encode with dual-branch encoder (geometric + semantic)
+        sd_embed = self.sd_query_encoder(polylines, attrs, has_tag, reliability)  # [N, embed_dims]
         sd_ref_pts = polylines  # [N, 20, 2]
 
         return sd_embed, sd_ref_pts, reliability, labels
 
-    def forward_train(self, bev_features, img_metas, gts, track_query_info=None, memory_bank=None, return_matching=False, sd_query_info=None):
+    def forward_train(self, bev_features, img_metas, gts, track_query_info=None, memory_bank=None, return_matching=False, sd_query_info=None,
+                      sd_prior_features=None, sd_prior_mask=None, sd_prior_coords=None):
         '''
         Args:
             bev_feature (List[Tensor]): shape [B, C, H, W]
@@ -424,6 +514,38 @@ class MapDetectorHead(nn.Module):
                 query_kp_mask = query_embedding.new_zeros((bs, self.num_queries), dtype=torch.bool)
                 final_query_meta = None
         
+        # Build SD features for cross-attention (if SD queries are used)
+        sd_ca_features = None
+        sd_ca_mask = None
+        if self.use_sd_queries and sd_query_info is not None:
+            # Pad SD embeddings to max_sd_queries across batch, shape: [max_sd, B, embed_dims]
+            sd_feat_list = []
+            sd_mask_list = []
+            for b_i in range(bs):
+                sd_embed_b = sd_query_info[b_i]['sd_embed']  # [N_sd, embed_dims]
+                n_sd = len(sd_embed_b)
+                pad_len = self.max_sd_queries - n_sd
+                if pad_len > 0:
+                    padded = torch.cat([sd_embed_b,
+                        torch.zeros(pad_len, self.embed_dims, device=sd_embed_b.device)])
+                else:
+                    padded = sd_embed_b[:self.max_sd_queries]
+                    n_sd = self.max_sd_queries
+                sd_feat_list.append(padded)
+                mask_b = torch.zeros(self.max_sd_queries, dtype=torch.bool, device=sd_embed_b.device)
+                mask_b[n_sd:] = True
+                sd_mask_list.append(mask_b)
+            sd_ca_features = torch.stack(sd_feat_list, dim=1)  # [max_sd, B, embed_dims]
+            sd_ca_mask = torch.stack(sd_mask_list, dim=0)      # [B, max_sd]
+
+        # Determine SD features source: new SD prior (cross-attn K,V) takes priority over old SDQueryEncoder
+        # NOTE: sd_prior_features is [B, max_sd_tokens, D] (batch-first).
+        #       sd_ca_features (old path) is [max_sd, B, D] (seq-first) — incompatible shape.
+        #       Only one path should be active at a time (use_sd_queries XOR use_sd_prior).
+        _sd_features = sd_prior_features if sd_prior_features is not None else sd_ca_features
+        _sd_mask = sd_prior_mask if sd_prior_mask is not None else sd_ca_mask
+        _sd_coords = sd_prior_coords  # only for new SD prior path
+
         # outs_dec: (num_layers, num_qs, bs, embed_dims)
         inter_queries, init_reference, inter_references = self.transformer(
             mlvl_feats=[bev_features,],
@@ -437,6 +559,9 @@ class MapDetectorHead(nn.Module):
             predict_refine=self.predict_refine,
             query_key_padding_mask=query_kp_mask, # mask used in self-attn,
             memory_bank=memory_bank,
+            sd_features=_sd_features,
+            sd_key_padding_mask=_sd_mask,
+            sd_coords=_sd_coords,
         )
 
         outputs = []
@@ -489,7 +614,8 @@ class MapDetectorHead(nn.Module):
         else:
             return outputs, loss_dict, det_match_idxs, det_match_gt_idxs, gt_info_list
     
-    def forward_test(self, bev_features, img_metas, track_query_info=None, memory_bank=None, sd_query_info=None):
+    def forward_test(self, bev_features, img_metas, track_query_info=None, memory_bank=None, sd_query_info=None,
+                     sd_prior_features=None, sd_prior_mask=None, sd_prior_coords=None):
         '''
         Args:
             bev_feature (List[Tensor]): shape [B, C, H, W]
@@ -601,6 +727,35 @@ class MapDetectorHead(nn.Module):
                     'reliability': rel,
                 })
 
+        # Build SD features for cross-attention (inference)
+        sd_ca_features_test = None
+        sd_ca_mask_test = None
+        if self.use_sd_queries and sd_query_info is not None:
+            sd_feat_list = []
+            sd_mask_list = []
+            for b_i in range(bs):
+                sd_embed_b = sd_query_info[b_i]['sd_embed']
+                n_sd = len(sd_embed_b)
+                pad_len = self.max_sd_queries - n_sd
+                if pad_len > 0:
+                    padded = torch.cat([sd_embed_b,
+                        torch.zeros(pad_len, self.embed_dims, device=sd_embed_b.device)])
+                else:
+                    padded = sd_embed_b[:self.max_sd_queries]
+                    n_sd = self.max_sd_queries
+                sd_feat_list.append(padded)
+                mask_b = torch.zeros(self.max_sd_queries, dtype=torch.bool, device=sd_embed_b.device)
+                mask_b[n_sd:] = True
+                sd_mask_list.append(mask_b)
+            sd_ca_features_test = torch.stack(sd_feat_list, dim=1)  # [max_sd, B, embed_dims]
+            sd_ca_mask_test = torch.stack(sd_mask_list, dim=0)      # [B, max_sd]
+
+        # Determine SD features source (same logic as forward_train)
+        # NOTE: sd_prior_features [B, tokens, D] batch-first vs sd_ca_features_test [tokens, B, D] seq-first
+        _sd_features = sd_prior_features if sd_prior_features is not None else sd_ca_features_test
+        _sd_mask = sd_prior_mask if sd_prior_mask is not None else sd_ca_mask_test
+        _sd_coords = sd_prior_coords
+
         # outs_dec: (num_layers, num_qs, bs, embed_dims)
         inter_queries, init_reference, inter_references = self.transformer(
             mlvl_feats=[bev_features,],
@@ -614,6 +769,9 @@ class MapDetectorHead(nn.Module):
             predict_refine=self.predict_refine,
             query_key_padding_mask=query_kp_mask, # mask used in self-attn,
             memory_bank=memory_bank,
+            sd_features=_sd_features,
+            sd_key_padding_mask=_sd_mask,
+            sd_coords=_sd_coords,
         )
 
         outputs = []
@@ -976,7 +1134,7 @@ class MapDetectorHead(nn.Module):
                 tmp_prop_flags = (qt == 0)  # track=0 → prop=True, sd/free/pad → False
             else:
                 num_det = self.num_free_queries if self.use_sd_queries else self.num_queries
-                tmp_prop_flags = torch.zeros(tmp_vectors.shape[0]).bool()
+                tmp_prop_flags = torch.zeros(tmp_vectors.shape[0], device=tmp_vectors.device).bool()
                 tmp_prop_flags[-num_det:] = 0
                 tmp_prop_flags[:-num_det] = 1
             num_preds, num_points2 = tmp_vectors.shape
@@ -1139,10 +1297,10 @@ class MapDetectorHead(nn.Module):
             if self.use_sd_queries and query_meta is not None:
                 # pos_track is a full-length boolean mask; extract track-only positives
                 track_pos_mask = pos_track[track_mask] if track_mask.any() else pos_track[:0]
-                global_ids_track = prop_ids[track_pos_mask]
+                global_ids_track = prop_ids[track_pos_mask.cpu()]
                 num_newborn = int((pos_det).sum())
             else:
-                global_ids_track = prop_ids[pos_track]
+                global_ids_track = prop_ids[pos_track.cpu()]
                 num_newborn = int(pos_det.sum())
 
             global_ids_newborn = torch.arange(num_newborn) + prop_num_instance

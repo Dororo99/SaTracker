@@ -18,7 +18,7 @@ img_w = 800
 img_size = (img_h, img_w)
 num_cams = 6
 
-num_gpus = 4
+num_gpus = 2
 batch_size = 3
 num_iters_per_epoch = 27846 // (num_gpus * batch_size)
 num_epochs = 18

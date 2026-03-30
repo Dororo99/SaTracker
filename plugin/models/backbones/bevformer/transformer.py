@@ -87,6 +87,8 @@ class PerceptionTransformer(BaseModule):
             prop_bev=None,
             prev_bev=None,
             warped_history_bev=None,
+            tile_feat=None,
+            tile_active=False,
             **kwargs):
         """
         obtain bev features.
@@ -140,6 +142,8 @@ class PerceptionTransformer(BaseModule):
             prev_bev=prev_bev,
             shift=shift,
             warped_history_bev=warped_history_bev,
+            tile_feat=tile_feat,
+            tile_active=tile_active,
             **kwargs
         )
 

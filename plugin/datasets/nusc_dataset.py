@@ -1,12 +1,16 @@
+import os
+import pickle
+
 from.base_dataset import BaseMapDataset
 from .map_utils.nuscmap_extractor import NuscMapExtractor
 from mmdet.datasets import DATASETS
 import numpy as np
+import cv2
+from PIL import Image
 from .visualize.renderer import Renderer
 import mmcv
 from time import time
 from pyquaternion import Quaternion
-import pickle
 
 
 @DATASETS.register_module()
@@ -25,7 +29,9 @@ class NuscDataset(BaseMapDataset):
         test_mode (bool): whether in test mode
     """
     
-    def __init__(self, data_root, sd_prior_cache_path=None, **kwargs):
+    def __init__(self, data_root, sd_prior_cache_path=None, osm_tile_dir=None,
+                 sd_raster_cache_path=None, sd_raster_thickness=5,
+                 sd_cache_v3_path=None, **kwargs):
         super().__init__(**kwargs)
         self.map_extractor = NuscMapExtractor(data_root, self.roi_size)
         self.renderer = Renderer(self.cat2id, self.roi_size, 'nusc')
@@ -33,11 +39,32 @@ class NuscDataset(BaseMapDataset):
         # Load SD prior cache
         self.sd_prior_cache = {}
         if sd_prior_cache_path is not None:
-            import os
             if os.path.exists(sd_prior_cache_path):
                 with open(sd_prior_cache_path, 'rb') as f:
                     self.sd_prior_cache = pickle.load(f)
                 print(f'Loaded SD prior cache: {len(self.sd_prior_cache)} samples from {sd_prior_cache_path}')
+
+        # OSM tile image directory
+        self.osm_tile_dir = osm_tile_dir
+        if osm_tile_dir is not None:
+            print(f'OSM tile dir: {osm_tile_dir} (exists={os.path.isdir(osm_tile_dir)})')
+
+        # SD cache v3: per-point SD prior for decoder cross-attention
+        self.sd_cache_v3 = {}
+        if sd_cache_v3_path is not None:
+            if os.path.exists(sd_cache_v3_path):
+                with open(sd_cache_v3_path, 'rb') as f:
+                    self.sd_cache_v3 = pickle.load(f)
+                print(f'Loaded SD cache v3: {len(self.sd_cache_v3)} samples from {sd_cache_v3_path}')
+
+        # SD raster: rasterize SD cache v2 vectors on-the-fly
+        self.sd_raster_cache = {}
+        self.sd_raster_thickness = sd_raster_thickness
+        if sd_raster_cache_path is not None:
+            if os.path.exists(sd_raster_cache_path):
+                with open(sd_raster_cache_path, 'rb') as f:
+                    self.sd_raster_cache = pickle.load(f)
+                print(f'Loaded SD raster cache (v2): {len(self.sd_raster_cache)} samples, thickness={sd_raster_thickness}')
     
     def load_annotations(self, ann_file):
         """Load annotations from ann_file.
@@ -160,8 +187,14 @@ class NuscDataset(BaseMapDataset):
             'lidar2ego_rotation': sample['lidar2ego_rotation'],
         }
 
-        # SD prior
+        # SD cache v3 (per-point SD prior for decoder cross-attention)
         token = sample['token']
+        if token in self.sd_cache_v3:
+            input_dict['sd_cache'] = self.sd_cache_v3[token]
+        else:
+            input_dict['sd_cache'] = None
+
+        # SD prior (legacy v1, for SDQueryEncoder)
         if token in self.sd_prior_cache:
             input_dict['sd_priors'] = self.sd_prior_cache[token]
         else:
@@ -173,4 +206,57 @@ class NuscDataset(BaseMapDataset):
                 'reliability': np.zeros((0,), dtype=np.float32),
             }
 
+        # SD raster (from v2 cache vectors) — takes priority over OSM tile
+        if self.sd_raster_cache:
+            if token in self.sd_raster_cache:
+                sd_v2 = self.sd_raster_cache[token]
+                raster = self._rasterize_sd_vectors(
+                    sd_v2['way_geometry'], sd_v2['crossing_geometry'])
+            else:
+                raster = np.zeros((100, 200), dtype=np.float32)
+            input_dict['osm_tile'] = raster[:, :, np.newaxis]  # [H, W, 1]
+
+        # OSM tile image (ego BEV frame, 200x100 RGB) — fallback if no sd_raster
+        elif self.osm_tile_dir is not None:
+            tile_path = os.path.join(self.osm_tile_dir, f'{token}.png')
+            if os.path.exists(tile_path):
+                tile_img = np.flipud(np.array(Image.open(tile_path))).copy()
+                input_dict['osm_tile'] = tile_img.astype(np.float32) / 255.0
+            else:
+                input_dict['osm_tile'] = np.zeros((100, 200, 3), dtype=np.float32)
+
         return input_dict
+
+    def _rasterize_sd_vectors(self, way_geometry, crossing_geometry):
+        """Rasterize SD cache v2 vectors into single-channel BEV image.
+
+        Args:
+            way_geometry: list of [Pi, 2] arrays in ego BEV meters
+            crossing_geometry: list of [Qj, 2] arrays in ego BEV meters
+
+        Returns:
+            raster: [H, W] float32 in {0.0, 1.0}
+        """
+        roi_x, roi_y = self.roi_size           # (60, 30)
+        # Canvas: 10/3 px per meter (consistent with pipeline canvas_size)
+        canvas_w = int(roi_x * 10 / 3)        # 200
+        canvas_h = int(roi_y * 10 / 3)        # 100
+        img = np.zeros((canvas_h, canvas_w), dtype=np.float32)
+
+        for poly in way_geometry:
+            if len(poly) < 2:
+                continue
+            col = (poly[:, 0] / roi_x + 0.5) * canvas_w
+            row = (poly[:, 1] / roi_y + 0.5) * canvas_h
+            pts = np.stack([col, row], axis=1).astype(np.int32)
+            cv2.polylines(img, [pts], False, 1.0, self.sd_raster_thickness)
+
+        for poly in crossing_geometry:
+            if len(poly) < 2:
+                continue
+            col = (poly[:, 0] / roi_x + 0.5) * canvas_w
+            row = (poly[:, 1] / roi_y + 0.5) * canvas_h
+            pts = np.stack([col, row], axis=1).astype(np.int32)
+            cv2.polylines(img, [pts], False, 1.0, self.sd_raster_thickness)
+
+        return img

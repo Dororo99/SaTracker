@@ -41,14 +41,45 @@ class MapTracker(BaseMapper):
                  use_memory=False,
                  mem_len=None,
                  mem_warmup_iters=-1,
+                 sd_augment=True,
+                 use_osm_tile=False,
+                 osm_tile_embed_dims=None,
+                 tile_warmup_iters=500,
+                 tile_source='osm_tile',
+                 use_sd_prior=False,
+                 sd_num_pts=5,
+                 max_sd_num=25,
                  **kwargs):
         super().__init__()
 
         #Attribute
         self.model_name = model_name
         self.last_epoch = None
-  
+
         self.backbone = build_backbone(backbone_cfg)
+
+        # SD prior encoder (decoder-level cross-attention K,V)
+        self.use_sd_prior = use_sd_prior
+        if use_sd_prior:
+            from ..modules.sd_prior_encoder import SDPriorEncoder
+            self.sd_encoder = SDPriorEncoder(
+                embed_dims=head_cfg.get('embed_dims', 512),
+                num_pts=sd_num_pts,
+                max_sd_tokens=max_sd_num * sd_num_pts,
+            )
+
+        # Tile/raster encoder for Stage 1 BEV feature enhancement
+        # TileBEVFusion lives inside BEVFormerEncoder (between Perspective-to-BEV CA and Memory Fusion)
+        # tile_source: 'osm_tile' (3ch RGB tile) or 'sd_raster' (1ch vector raster)
+        self.use_osm_tile = use_osm_tile
+        self.tile_warmup_iters = tile_warmup_iters
+        self.tile_source = tile_source
+        if use_osm_tile:
+            from ..modules.osm_tile_encoder import OSMTileEncoder
+            _tile_dims = osm_tile_embed_dims or backbone_cfg.get('transformer', {}).get('embed_dims', 256)
+            _tile_in_ch = 1 if tile_source == 'sd_raster' else 3
+            self.tile_encoder = OSMTileEncoder(in_channels=_tile_in_ch, embed_dims=_tile_dims)
+            self.tile_encoder.init_weights()
 
         if neck_cfg is not None:
             self.neck = build_head(neck_cfg)
@@ -69,6 +100,7 @@ class MapTracker(BaseMapper):
         self.track_fp_aug = track_fp_aug
         self.use_memory = use_memory
         self.mem_warmup_iters = mem_warmup_iters
+        self.sd_augment = sd_augment
 
         # the track query propagation module, using relative pose
         c_dim = 7 # quaternion for rotation (4) + translation (3)
@@ -126,6 +158,12 @@ class MapTracker(BaseMapper):
                 self.neck.init_weights()
             except AttributeError:
                 pass
+
+    def _encode_osm_tile(self, osm_tile):
+        """Encode OSM tile image to feature map. Returns None if not applicable."""
+        if not self.use_osm_tile or osm_tile is None:
+            return None
+        return self.tile_encoder(osm_tile)
 
     def temporal_propagate(self, curr_bev_feats, img_metas, all_history_curr2prev, all_history_prev2curr, use_memory,
                            track_query_info=None, timestep=None, get_trans_loss=False):
@@ -454,8 +492,8 @@ class MapTracker(BaseMapper):
         """
         sd_query_info = []
         for sd_priors in sd_priors_batch:
-            # Apply augmentation during training
-            if self.training:
+            # Apply augmentation during training (controlled by sd_augment flag)
+            if self.training and self.sd_augment:
                 sd_priors = self._augment_sd_priors(sd_priors)
             sd_embed, sd_ref_pts, sd_reliability, sd_labels = \
                 self.head.build_sd_queries(sd_priors, device)
@@ -468,7 +506,7 @@ class MapTracker(BaseMapper):
         return sd_query_info
 
     def forward_train(self, img, vectors, semantic_mask, points=None, img_metas=None, all_prev_data=None,
-                      all_local2global_info=None, sd_priors=None, **kwargs):
+                      all_local2global_info=None, sd_priors=None, osm_tile=None, **kwargs):
         '''
         Args:
             img: torch.Tensor of shape [B, N, 3, H, W]
@@ -490,11 +528,13 @@ class MapTracker(BaseMapper):
         bs = img.shape[0]
 
         _use_memory = self.use_memory and self.num_iter > self.mem_warmup_iters
-        
+        _tile_active = self.use_osm_tile  # sigmoid gate handles soft warmup, no hard warmup needed
+
         if all_prev_data is not None:
             num_prev_frames = len(all_prev_data)
             all_gts_prev, all_img_prev, all_img_metas_prev, all_semantic_mask_prev  = [], [], [], []
             all_sd_priors_prev = []
+            all_osm_tile_prev = []
             for prev_data in all_prev_data:
                 gts_prev, img_prev, img_metas_prev, valid_idx_prev, _ = self.batch_data(
                     prev_data['vectors'], prev_data['img'], prev_data['img_metas'], img.device
@@ -504,6 +544,7 @@ class MapTracker(BaseMapper):
                 all_img_metas_prev.append(img_metas_prev)
                 all_semantic_mask_prev.append(prev_data['semantic_mask'])
                 all_sd_priors_prev.append(prev_data.get('sd_priors', None))
+                all_osm_tile_prev.append(prev_data.get('osm_tile', None))
         else:
             num_prev_frames = 0
 
@@ -539,16 +580,21 @@ class MapTracker(BaseMapper):
             all_history_curr2prev, all_history_prev2curr, all_history_coord =  \
                     self.process_history_info(all_img_metas_prev[t], history_img_metas)
 
-            _bev_feats, mlvl_feats = self.backbone(all_img_prev[t], all_img_metas_prev[t], t, history_bev_feats, 
-                        history_img_metas, all_history_coord, points=None, 
-                        img_backbone_gradient=img_backbone_gradient)
+            # Encode OSM tile for prev frame (tile CA now happens inside BEVFormerEncoder)
+            prev_osm_tile = all_osm_tile_prev[t] if all_osm_tile_prev else None
+            prev_tile_feat = self._encode_osm_tile(prev_osm_tile)
+
+            _bev_feats, mlvl_feats = self.backbone(all_img_prev[t], all_img_metas_prev[t], t, history_bev_feats,
+                        history_img_metas, all_history_coord, points=None,
+                        img_backbone_gradient=img_backbone_gradient, tile_feat=prev_tile_feat,
+                        tile_active=_tile_active)
 
             # Neck for prev
             bev_feats = self.neck(_bev_feats)
 
             if _use_memory:
                 self.memory_bank.curr_t = t
-            
+
             # Transform prev-frame feature & pts to curr frame
             if self.skip_vector_head or t == 0:
                 self.temporal_propagate(bev_feats, all_img_metas_prev[t], all_history_curr2prev, 
@@ -604,6 +650,13 @@ class MapTracker(BaseMapper):
                     filtered_sd = self.filter_sd_priors_by_tracks(prev_sd_priors, track_query_info, bev_feats.device)
                     sd_query_info_t = self.build_sd_query_info(filtered_sd, bev_feats.device)
 
+                # SD prior for prev frame
+                sd_prior_features_t, sd_prior_mask_t, sd_prior_coords_t = None, None, None
+                if self.use_sd_prior:
+                    sd_cache_list_t = [meta.get('sd_cache', None) for meta in img_metas_prev]
+                    sd_prior_features_t, sd_prior_mask_t, sd_prior_coords_t = \
+                        self.sd_encoder(sd_cache_list_t, self.roi_size)
+
                 # 1). Compute the loss for prev frame
                 # 2). Get the matching results for computing the track query to next frame
                 loss_dict_prev, outputs_prev, prev_inds_list, prev_gt_inds_list, prev_matched_reg_cost, \
@@ -615,7 +668,10 @@ class MapTracker(BaseMapper):
                                         memory_bank=memory_bank,
                                         return_loss=True,
                                         return_matching=True,
-                                        sd_query_info=sd_query_info_t)
+                                        sd_query_info=sd_query_info_t,
+                                        sd_prior_features=sd_prior_features_t,
+                                        sd_prior_mask=sd_prior_mask_t,
+                                        sd_prior_coords=sd_prior_coords_t)
                 all_outputs_prev.append(outputs_prev)
 
                 if t > 0:
@@ -645,8 +701,12 @@ class MapTracker(BaseMapper):
 
         all_history_curr2prev, all_history_prev2curr, all_history_coord = self.process_history_info(img_metas, history_img_metas)
 
+        # Encode OSM tile for current frame (tile CA now happens inside BEVFormerEncoder)
+        curr_tile_feat = self._encode_osm_tile(osm_tile)
+
         _bev_feats, mlvl_feats = self.backbone(img, img_metas, num_prev_frames, history_bev_feats, history_img_metas, all_history_coord,
-                    points=None, img_backbone_gradient=img_backbone_gradient)
+                    points=None, img_backbone_gradient=img_backbone_gradient, tile_feat=curr_tile_feat,
+                    tile_active=_tile_active)
         # Neck for curr
         bev_feats = self.neck(_bev_feats)
 
@@ -670,9 +730,12 @@ class MapTracker(BaseMapper):
             #import pdb; pdb.set_trace()
             ########################################################
 
-        seg_preds, seg_feats, seg_loss, seg_dice_loss = self.seg_decoder(bev_feats, gt_semantic, 
+        seg_preds, seg_feats, seg_loss, seg_dice_loss = self.seg_decoder(bev_feats, gt_semantic,
                 all_history_coord, return_loss=True)
-        
+
+        # Store last-frame BEV features for subclass access (e.g. SatMapTracker logging)
+        self._last_bev_feats = bev_feats
+
         if not self.skip_vector_head:
             memory_bank = self.memory_bank if _use_memory else None
 
@@ -683,6 +746,13 @@ class MapTracker(BaseMapper):
                 filtered_sd = self.filter_sd_priors_by_tracks(curr_sd_priors, track_query_info, bev_feats.device)
                 sd_query_info_curr = self.build_sd_query_info(filtered_sd, bev_feats.device)
 
+            # SD prior encoding (decoder cross-attention K,V)
+            sd_prior_features, sd_prior_mask, sd_prior_coords = None, None, None
+            if self.use_sd_prior:
+                sd_cache_list = [meta.get('sd_cache', None) for meta in img_metas]
+                sd_prior_features, sd_prior_mask, sd_prior_coords = \
+                    self.sd_encoder(sd_cache_list, self.roi_size)
+
             # 3. run the head again and compute the loss for the second frame
             preds_list, loss_dict, det_match_idxs, det_match_gt_idxs, gt_list = self.head(
                 bev_features=bev_feats,
@@ -691,7 +761,10 @@ class MapTracker(BaseMapper):
                 track_query_info=track_query_info,
                 memory_bank=memory_bank,
                 return_loss=True,
-                sd_query_info=sd_query_info_curr)
+                sd_query_info=sd_query_info_curr,
+                sd_prior_features=sd_prior_features,
+                sd_prior_mask=sd_prior_mask,
+                sd_prior_coords=sd_prior_coords)
         else:
             loss_dict = {}
         
@@ -731,7 +804,7 @@ class MapTracker(BaseMapper):
         return loss, log_vars, num_sample
 
     @torch.no_grad()
-    def forward_test(self, img, points=None, img_metas=None, seq_info=None, sd_priors=None, **kwargs):
+    def forward_test(self, img, points=None, img_metas=None, seq_info=None, sd_priors=None, osm_tile=None, **kwargs):
         '''
             inference pipeline
         '''
@@ -764,12 +837,23 @@ class MapTracker(BaseMapper):
         all_history_curr2prev, all_history_prev2curr, all_history_coord =  \
                     self.process_history_info(img_metas, history_img_metas)
 
+        # Encode OSM tile (tile CA now happens inside BEVFormerEncoder)
+        tile_feat = self._encode_osm_tile(osm_tile)
+
         _bev_feats, mlvl_feats = self.backbone(img, img_metas, local_idx, history_bev_feats, history_img_metas,
-                        all_history_coord, points=points)
-        
+                        all_history_coord, points=points, tile_feat=tile_feat,
+                        tile_active=self.use_osm_tile)
+
         img_shape = [_bev_feats.shape[2:] for i in range(_bev_feats.shape[0])]
         # Neck
         bev_feats = self.neck(_bev_feats)
+
+        # SD prior encoding (shared for both first_frame and non-first_frame)
+        sd_prior_features, sd_prior_mask, sd_prior_coords = None, None, None
+        if self.use_sd_prior:
+            sd_cache_list = [meta.get('sd_cache', None) for meta in img_metas]
+            sd_prior_features, sd_prior_mask, sd_prior_coords = \
+                self.sd_encoder(sd_cache_list, self.roi_size)
 
         if self.skip_vector_head or first_frame:
             self.temporal_propagate(bev_feats, img_metas, all_history_curr2prev, \
@@ -783,7 +867,10 @@ class MapTracker(BaseMapper):
                     sd_query_info = self.build_sd_query_info(curr_sd, bev_feats.device)
 
                 preds_list = self.head(bev_feats, img_metas=img_metas, return_loss=False,
-                            sd_query_info=sd_query_info)
+                            sd_query_info=sd_query_info,
+                            sd_prior_features=sd_prior_features,
+                            sd_prior_mask=sd_prior_mask,
+                            sd_prior_coords=sd_prior_coords)
             track_dict = None
         else:
             # Using the saved prev-frame output to prepare the track query inputs
@@ -804,7 +891,10 @@ class MapTracker(BaseMapper):
             memory_bank = self.memory_bank if self.use_memory else None
             preds_list = self.head(bev_feats, img_metas=img_metas,
                         track_query_info=track_query_info, memory_bank=memory_bank,
-                        return_loss=False, sd_query_info=sd_query_info)
+                        return_loss=False, sd_query_info=sd_query_info,
+                        sd_prior_features=sd_prior_features,
+                        sd_prior_mask=sd_prior_mask,
+                        sd_prior_coords=sd_prior_coords)
             track_dict = self._process_track_query_info(track_query_info)
             
         if not self.skip_vector_head:
