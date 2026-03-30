@@ -148,7 +148,7 @@ class VectorInstanceMemory(nn.Module):
         self.num_ins[batch_i] = num_instances
         self.mem_entry_lengths[batch_i][mem_instance_ids] += 1
         self.active_mem_ids[batch_i] = mem_instance_ids.long().to(propagated_ids.device)
-        active_mem_entry_lens = self.mem_entry_lengths[batch_i][self.active_mem_ids[batch_i]]
+        active_mem_entry_lens = self.mem_entry_lengths[batch_i][self.active_mem_ids[batch_i].cpu()]
         self.valid_track_idx[batch_i] = torch.where(active_mem_entry_lens >= 1)[0]
 
         #print('Active memory ids:', self.active_mem_ids[batch_i])
@@ -186,7 +186,7 @@ class VectorInstanceMemory(nn.Module):
         seq_id = metas['local_idx']
         
         active_mem_ids = self.active_mem_ids[b_i]
-        mem_entry_lens = self.mem_entry_lengths[b_i][active_mem_ids]
+        mem_entry_lens = self.mem_entry_lengths[b_i][active_mem_ids.cpu()]
         num_track_ins = len(active_mem_ids)
         valid_mem_len = min(self.curr_t, self.mem_len)
         valid_bank_size = min(self.curr_t, self.bank_size)
@@ -233,7 +233,7 @@ class VectorInstanceMemory(nn.Module):
         # prepare relative seq idx gap
         relative_seq_idx = torch.zeros_like(mem_embeds[:,:,0]).long()
         relative_seq_idx[:valid_mem_len] = seq_id - mem_seq_ids[:valid_mem_len]
-        relative_seq_pe = self.cached_pe[relative_seq_idx].to(mem_embeds.device)
+        relative_seq_pe = self.cached_pe[relative_seq_idx.cpu()].to(mem_embeds.device)
 
         # prepare relative pose information for each active instance
         curr2prev_matrix, prev2curr_matrix = self.prepare_transformation_batch(mem_trans[:valid_bank_size],
