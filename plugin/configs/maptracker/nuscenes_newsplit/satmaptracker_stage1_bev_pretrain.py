@@ -285,7 +285,12 @@ model = dict(
         loss_dice=dict(
             type='MaskDiceLoss',
             loss_weight=1.0,
-        )
+        ),
+        loss_skel=dict(
+            type='SkelRecallLoss',
+            loss_weight=1.0,
+            skel_classes=[1, 2],
+        ),
     ),
     model_name='SingleStage'
 )
@@ -308,6 +313,7 @@ train_pipeline = [
         thickness=thickness,
         semantic_mask=True,
     ),
+    dict(type='SkeletonizeMap', skel_classes=[1, 2], num_dilations=2),
     dict(type='LoadMultiViewImagesFromFiles', to_float32=True),
     dict(type='LoadAID4ADSatelliteImage',
          sat_root=sat_root,
@@ -321,7 +327,7 @@ train_pipeline = [
     dict(type='Normalize3D', **img_norm_cfg),
     dict(type='PadMultiViewImages', size_divisor=32),
     dict(type='FormatBundleMap'),
-    dict(type='Collect3D', keys=['img', 'vectors', 'semantic_mask', 'sat_img'], meta_keys=(
+    dict(type='Collect3D', keys=['img', 'vectors', 'semantic_mask', 'skeleton_mask', 'sat_img'], meta_keys=(
         'token', 'ego2img', 'sample_idx', 'ego2global_translation',
         'ego2global_rotation', 'img_shape', 'scene_name'))
 ]
@@ -463,5 +469,9 @@ log_config = dict(
             )
         )
     ])
+
+custom_hooks = [
+    dict(type='WandbBEVVisHook', interval=500, vis_skeleton=True),
+]
 
 SyncBN = True

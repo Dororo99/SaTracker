@@ -24,6 +24,7 @@ class MapSegHead(nn.Module):
                  canvas_size=(200,100),
                  loss_seg=dict(),
                  loss_dice=dict(),
+                 loss_skel=None,
         ):
         super().__init__()
         self.num_classes = num_classes
@@ -34,6 +35,13 @@ class MapSegHead(nn.Module):
 
         self.loss_seg = build_loss(loss_seg)
         self.loss_dice = build_loss(loss_dice)
+
+        if loss_skel is not None:
+            self.loss_skel = build_loss(loss_skel)
+            self.use_skel_loss = True
+        else:
+            self.loss_skel = None
+            self.use_skel_loss = False
 
         if self.loss_seg.use_sigmoid:
             self.cls_out_channels = num_classes
@@ -68,7 +76,7 @@ class MapSegHead(nn.Module):
             m = self.conv_out
             nn.init.constant_(m.bias, bias_init)
     
-    def forward_train(self, bev_features, gts, history_coords):
+    def forward_train(self, bev_features, gts, history_coords, skel_gts=None):
         x = self.relu(self.conv_in(bev_features))
         for conv_mid in self.conv_mid_layers:
             x = conv_mid(x)
@@ -76,13 +84,18 @@ class MapSegHead(nn.Module):
 
         seg_loss = self.loss_seg(preds, gts)
         dice_loss = self.loss_dice(preds, gts)
-        
+
+        if self.use_skel_loss and skel_gts is not None:
+            skel_loss = self.loss_skel(preds, skel_gts)
+        else:
+            skel_loss = preds.new_tensor(0.0)
+
         # downsample the features to the original bev size
         seg_feats = x
         for downsample in self.downsample_layers:
             seg_feats = downsample(seg_feats)
 
-        return preds, seg_feats, seg_loss, dice_loss
+        return preds, seg_feats, seg_loss, dice_loss, skel_loss
         
     def forward_test(self, bev_features):
         x = self.relu(self.conv_in(bev_features))

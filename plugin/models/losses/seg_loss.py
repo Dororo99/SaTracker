@@ -121,3 +121,49 @@ class MaskDiceLoss(nn.Module):
         
         loss = self.loss_weight * dice_loss
         return loss
+
+
+@LOSSES.register_module()
+class SkelRecallLoss(nn.Module):
+    """Skeleton Recall Loss for thin-structure segmentation.
+
+    Computes (1 - recall) on skeleton pixels for specified classes.
+    Classes with all-zero skeleton contribute zero loss.
+
+    Args:
+        loss_weight (float): Weight for this loss term. Default: 1.0.
+        skel_classes (list[int]): Class indices to compute loss on.
+            Default: [1, 2] (divider, boundary).
+    """
+
+    def __init__(self, loss_weight=1.0, skel_classes=None):
+        super(SkelRecallLoss, self).__init__()
+        self.loss_weight = loss_weight
+        self.skel_classes = skel_classes if skel_classes is not None else [1, 2]
+        self.eps = 1e-5
+
+    def forward(self, pred, skel_gt):
+        """
+        Args:
+            pred: (B, C, H, W) raw logits from seg head.
+            skel_gt: (B, C, H, W) skeleton ground truth (0 or 1).
+        Returns:
+            loss: scalar tensor.
+        """
+        pred_sigmoid = pred.sigmoid()
+        loss = pred.new_tensor(0.0)
+        num_valid = 0
+
+        for cls_idx in self.skel_classes:
+            skel_cls = skel_gt[:, cls_idx].float()  # (B, H, W)
+            pred_cls = pred_sigmoid[:, cls_idx]      # (B, H, W)
+            skel_sum = skel_cls.sum()
+            if skel_sum > 0:
+                recall = (pred_cls * skel_cls).sum() / (skel_sum + self.eps)
+                loss = loss + (1.0 - recall)
+                num_valid += 1
+
+        if num_valid > 0:
+            loss = loss / num_valid
+
+        return self.loss_weight * loss

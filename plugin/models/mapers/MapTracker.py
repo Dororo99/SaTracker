@@ -449,7 +449,9 @@ class MapTracker(BaseMapper):
             local2global_next = all_local2global_info[t+1]
 
             # Compute the semantic segmentation loss
-            seg_preds, seg_feats, seg_loss, seg_dice_loss = self.seg_decoder(bev_feats, gts_semantic_prev,
+            # Note: skel_gts not passed here -- skeleton loss is only active in SatMapTracker.
+            # seg_skel_loss is always 0.0 in MapTracker (no skeleton_mask in this path).
+            seg_preds, seg_feats, seg_loss, seg_dice_loss, seg_skel_loss = self.seg_decoder(bev_feats, gts_semantic_prev,
                     all_history_coord, return_loss=True)
 
             # Save the history 
@@ -495,6 +497,7 @@ class MapTracker(BaseMapper):
 
             loss_dict_prev['seg'] = seg_loss
             loss_dict_prev['seg_dice'] = seg_dice_loss
+            loss_dict_prev['seg_skel'] = seg_skel_loss
 
             all_loss_dict_prev.append(loss_dict_prev)
 
@@ -532,9 +535,10 @@ class MapTracker(BaseMapper):
             #import pdb; pdb.set_trace()
             ########################################################
 
-        seg_preds, seg_feats, seg_loss, seg_dice_loss = self.seg_decoder(bev_feats, gt_semantic, 
+        # Note: skel_gts not passed -- skeleton loss is only active in SatMapTracker.
+        seg_preds, seg_feats, seg_loss, seg_dice_loss, seg_skel_loss = self.seg_decoder(bev_feats, gt_semantic,
                 all_history_coord, return_loss=True)
-        
+
         if not self.skip_vector_head:
             memory_bank = self.memory_bank if _use_memory else None
             # 3. run the head again and compute the loss for the second frame
@@ -550,6 +554,7 @@ class MapTracker(BaseMapper):
         
         loss_dict['seg'] = seg_loss
         loss_dict['seg_dice'] = seg_dice_loss
+        loss_dict['seg_skel'] = seg_skel_loss
 
         # format loss, average over all frames (2 frames for now)
         loss = 0

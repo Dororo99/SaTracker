@@ -64,6 +64,14 @@ class FormatBundleMap(object):
                 assert isinstance(results['semantic_mask'], list)
                 results['semantic_mask'] = DC(results['semantic_mask'], stack=False)
 
+        if 'skeleton_mask' in results:
+            if isinstance(results['skeleton_mask'], np.ndarray):
+                results['skeleton_mask'] = DC(to_tensor(results['skeleton_mask']), stack=True,
+                                              pad_dims=None)
+            else:
+                assert isinstance(results['skeleton_mask'], list)
+                results['skeleton_mask'] = DC(results['skeleton_mask'], stack=False)
+
         if 'sat_img' in results:
             sat_img = np.ascontiguousarray(results['sat_img'])
             results['sat_img'] = DC(to_tensor(sat_img), stack=True)

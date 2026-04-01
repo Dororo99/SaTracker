@@ -35,7 +35,8 @@ class SatMapTracker(MapTracker):
 
     def forward_train(self, img, vectors, semantic_mask, points=None,
                       img_metas=None, all_prev_data=None,
-                      all_local2global_info=None, sat_img=None, **kwargs):
+                      all_local2global_info=None, sat_img=None,
+                      skeleton_mask=None, **kwargs):
 
         gts, img, img_metas, valid_idx, points = self.batch_data(
             vectors, img, img_metas, img.device, points)
@@ -47,6 +48,7 @@ class SatMapTracker(MapTracker):
             num_prev_frames = len(all_prev_data)
             all_gts_prev, all_img_prev, all_img_metas_prev, all_semantic_mask_prev = [], [], [], []
             all_sat_img_prev = []
+            all_skeleton_mask_prev = []
             for prev_data in all_prev_data:
                 gts_prev, img_prev, img_metas_prev, valid_idx_prev, _ = self.batch_data(
                     prev_data['vectors'], prev_data['img'], prev_data['img_metas'], img.device)
@@ -55,6 +57,7 @@ class SatMapTracker(MapTracker):
                 all_img_metas_prev.append(img_metas_prev)
                 all_semantic_mask_prev.append(prev_data['semantic_mask'])
                 all_sat_img_prev.append(prev_data.get('sat_img', None))
+                all_skeleton_mask_prev.append(prev_data.get('skeleton_mask', None))
         else:
             num_prev_frames = 0
 
@@ -78,6 +81,7 @@ class SatMapTracker(MapTracker):
         history_bev_feats = []
         history_img_metas = []
         gt_semantic = torch.flip(semantic_mask, [2,])
+        gt_skeleton = torch.flip(skeleton_mask, [2,]) if skeleton_mask is not None else None
 
         # Iterate through prev frames
         for t in range(num_prev_frames):
@@ -116,12 +120,13 @@ class SatMapTracker(MapTracker):
             gts_next = all_gts_prev[t+1] if t != num_prev_frames-1 else gts
             gts_semantic_prev = torch.flip(all_semantic_mask_prev[t], [2,])
             gts_semantic_curr = torch.flip(all_semantic_mask_prev[t+1], [2,]) if t != num_prev_frames-1 else gt_semantic
+            gts_skeleton_prev = torch.flip(all_skeleton_mask_prev[t], [2,]) if all_skeleton_mask_prev[t] is not None else None
 
             local2global_prev = all_local2global_info[t]
             local2global_next = all_local2global_info[t+1]
 
-            seg_preds, seg_feats, seg_loss, seg_dice_loss = self.seg_decoder(
-                bev_feats, gts_semantic_prev, all_history_coord, return_loss=True)
+            seg_preds, seg_feats, seg_loss, seg_dice_loss, seg_skel_loss = self.seg_decoder(
+                bev_feats, gts_semantic_prev, all_history_coord, skel_gts=gts_skeleton_prev, return_loss=True)
 
             history_bev_feats.append(bev_feats)
             history_img_metas.append(all_img_metas_prev[t])
@@ -155,6 +160,7 @@ class SatMapTracker(MapTracker):
 
             loss_dict_prev['seg'] = seg_loss
             loss_dict_prev['seg_dice'] = seg_dice_loss
+            loss_dict_prev['seg_skel'] = seg_skel_loss
             all_loss_dict_prev.append(loss_dict_prev)
 
         if _use_memory:
@@ -187,8 +193,8 @@ class SatMapTracker(MapTracker):
                 track_query_info, timestep=num_prev_frames, get_trans_loss=True)
             all_trans_loss.append(trans_loss_dict)
 
-        seg_preds, seg_feats, seg_loss, seg_dice_loss = self.seg_decoder(
-            bev_feats, gt_semantic, all_history_coord, return_loss=True)
+        seg_preds, seg_feats, seg_loss, seg_dice_loss, seg_skel_loss = self.seg_decoder(
+            bev_feats, gt_semantic, all_history_coord, skel_gts=gt_skeleton, return_loss=True)
 
         if not self.skip_vector_head:
             memory_bank = self.memory_bank if _use_memory else None
@@ -201,6 +207,7 @@ class SatMapTracker(MapTracker):
 
         loss_dict['seg'] = seg_loss
         loss_dict['seg_dice'] = seg_dice_loss
+        loss_dict['seg_skel'] = seg_skel_loss
 
         # Aggregate losses
         loss = 0
@@ -232,7 +239,13 @@ class SatMapTracker(MapTracker):
             encoder = self.backbone.transformer.encoder
             for lid, layer in enumerate(encoder.layers):
                 if hasattr(layer, 'sat_gate'):
-                    log_vars[f'sat_gate_L{lid}'] = torch.tanh(layer.sat_gate).item()
+                    log_vars[f'sat_gate_L{lid}'] = torch.sigmoid(layer.sat_gate).item()
+
+        # Store BEV seg preds and GT for visualization hooks
+        self._vis_seg_preds = seg_preds.detach()
+        self._vis_gt_semantic = gt_semantic.detach()
+        if gt_skeleton is not None:
+            self._vis_gt_skeleton = gt_skeleton.detach()
 
         num_sample = img.size(0)
         return loss, log_vars, num_sample
