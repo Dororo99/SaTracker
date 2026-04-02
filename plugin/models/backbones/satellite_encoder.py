@@ -1,6 +1,6 @@
 """
-Satellite image encoder for BEV-aligned feature extraction.
-Uses ResNet50 + FPN-like neck to encode satellite images to BEV-sized features.
+Satellite image encoder using ResNet + FPN.
+Returns tokens (B, N, C) + grid_size, same interface as SatMAEEncoder.
 """
 import torch
 import torch.nn as nn
@@ -10,25 +10,28 @@ from mmdet.models import BACKBONES, build_backbone
 
 @BACKBONES.register_module()
 class SatelliteEncoder(nn.Module):
-    """Encode satellite images into BEV-aligned feature maps.
+    """Encode satellite images into patch tokens via ResNet + FPN.
+
+    Returns (tokens, grid_size) — same interface as SatMAEEncoder,
+    so it can be used as a drop-in replacement.
 
     Args:
-        backbone_cfg (dict): Config for backbone (default: ResNet50).
+        backbone_cfg (dict): Config for ResNet backbone.
         neck_in_channels (list): Input channels from each backbone stage.
-        out_channels (int): Output feature channels (should match bev_embed_dims).
-        bev_size (tuple): Target BEV feature size (H, W), e.g. (50, 100).
-        frozen (bool): Whether to freeze all parameters after init.
+        out_channels (int): Output token channels (should match bev_embed_dims).
+        token_grid_size (int): Output spatial grid size. Tokens = grid_size^2.
+        frozen (bool): Whether to freeze all parameters.
     """
 
     def __init__(self,
                  backbone_cfg=None,
                  neck_in_channels=None,
                  out_channels=256,
-                 bev_size=(50, 100),
+                 token_grid_size=14,
                  frozen=False):
         super().__init__()
-        self.bev_size = bev_size
         self.out_channels = out_channels
+        self.token_grid_size = token_grid_size
 
         if backbone_cfg is None:
             backbone_cfg = dict(
@@ -82,9 +85,10 @@ class SatelliteEncoder(nn.Module):
     def forward(self, sat_img):
         """
         Args:
-            sat_img (Tensor): (B, 3, H, W) satellite image, normalized.
+            sat_img (Tensor): (B, 3, H, W) satellite image.
         Returns:
-            Tensor: (B, C, bev_h, bev_w) satellite BEV features.
+            tokens (Tensor): (B, grid_size^2, out_channels)
+            grid_size (int): spatial grid dimension
         """
         feats = self.backbone(sat_img)
 
@@ -99,9 +103,12 @@ class SatelliteEncoder(nn.Module):
 
         out = self.output_conv(out)
 
-        # Resize to BEV size
-        if out.shape[2:] != tuple(self.bev_size):
-            out = F.interpolate(out, size=self.bev_size,
-                                mode='bilinear', align_corners=False)
+        # Resize to square token grid
+        gs = self.token_grid_size
+        out = F.interpolate(out, size=(gs, gs),
+                            mode='bilinear', align_corners=False)
 
-        return out
+        # (B, C, gs, gs) → (B, gs*gs, C)
+        tokens = out.flatten(2).permute(0, 2, 1)
+
+        return tokens, gs

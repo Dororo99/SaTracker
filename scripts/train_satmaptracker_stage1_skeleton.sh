@@ -6,6 +6,7 @@
 #   bash scripts/train_satmaptracker_stage1_skeleton.sh --no-skeleton      # skeleton OFF
 #   bash scripts/train_satmaptracker_stage1_skeleton.sh --no-cross-attn    # early fusion OFF
 #   bash scripts/train_satmaptracker_stage1_skeleton.sh --no-conv-fusion   # late fusion OFF
+#   bash scripts/train_satmaptracker_stage1_skeleton.sh --sat-encoder resnet_fpn  # ResNet50+FPN encoder
 #   bash scripts/train_satmaptracker_stage1_skeleton.sh --sat-gate -1.0    # cross-attn gate init
 #   bash scripts/train_satmaptracker_stage1_skeleton.sh --fusion-gate -1.0 # conv fusion gate init
 #   bash scripts/train_satmaptracker_stage1_skeleton.sh --gpus 4,5,6,7     # custom GPUs
@@ -22,15 +23,16 @@ MASTER_PORT=29571
 USE_SKELETON=true
 SKEL_WEIGHT=1.0
 SKEL_CLASSES="[1,2]"
+SAT_ENCODER=satmae
 USE_CROSS_ATTN=true
 SAT_FUSION_MODE=gate
 SAT_GATE_INIT=-1.0
-USE_CONV_FUSION=true
+USE_CONV_FUSION=false
 FUSION_GATE_INIT=-1.0
 BEV_VIS_INTERVAL=500
 WANDB_ENTITY="IRCV_Mapping"
 WANDB_PROJECT="Third-SatMAE_MapTracker-AID4AD-seonghyun"
-WANDB_NAME="SatMAETracker_sig25_skeleton"
+WANDB_NAME="SatMAETracker_sig25_skeleton_add"
 CONFIG="plugin/configs/maptracker/nuscenes_newsplit/satmaptracker_stage1_bev_pretrain.py"
 
 # ============================================================
@@ -50,6 +52,9 @@ while [[ $# -gt 0 ]]; do
             shift ;;
         --skel-weight)
             SKEL_WEIGHT="$2"
+            shift 2 ;;
+        --sat-encoder)
+            SAT_ENCODER="$2"
             shift 2 ;;
         --no-cross-attn)
             USE_CROSS_ATTN=false
@@ -100,8 +105,28 @@ else
     echo "[Config] Skeleton-Recall Loss: OFF"
 fi
 
-# Cross-attention (early fusion) control
+# Satellite encoder selection
 if [ "$USE_CROSS_ATTN" = true ]; then
+    if [ "$SAT_ENCODER" = "resnet_fpn" ]; then
+        CFG_OPTIONS+=" --cfg-options model.sat_encoder_cfg.type=SatelliteEncoder"
+        CFG_OPTIONS+=" --cfg-options model.sat_encoder_cfg.out_channels=256"
+        CFG_OPTIONS+=" --cfg-options model.sat_encoder_cfg.token_grid_size=14"
+        CFG_OPTIONS+=" --cfg-options model.sat_encoder_cfg.frozen=False"
+        # Remove SatMAE-only keys
+        CFG_OPTIONS+=" --cfg-options model.sat_encoder_cfg.backbone_cfg.type=ResNet"
+        CFG_OPTIONS+=" --cfg-options model.sat_encoder_cfg.backbone_cfg.depth=50"
+        CFG_OPTIONS+=" --cfg-options model.sat_encoder_cfg.backbone_cfg.num_stages=4"
+        CFG_OPTIONS+=" --cfg-options model.sat_encoder_cfg.backbone_cfg.out_indices=[0,1,2,3]"
+        CFG_OPTIONS+=" --cfg-options model.sat_encoder_cfg.backbone_cfg.frozen_stages=-1"
+        CFG_OPTIONS+=" --cfg-options model.sat_encoder_cfg.backbone_cfg.norm_cfg.type=BN2d"
+        CFG_OPTIONS+=" --cfg-options model.sat_encoder_cfg.backbone_cfg.norm_eval=True"
+        CFG_OPTIONS+=" --cfg-options model.sat_encoder_cfg.backbone_cfg.style=pytorch"
+        echo "[Config] Satellite Encoder: ResNet50+FPN (trainable, grid=14×14)"
+    else
+        echo "[Config] Satellite Encoder: SatMAE ViT-L (frozen)"
+    fi
+
+    # Cross-attention fusion mode
     CFG_OPTIONS+=" --cfg-options model.backbone_cfg.transformer.encoder.transformerlayers.sat_fusion_mode=${SAT_FUSION_MODE}"
     if [ "$SAT_FUSION_MODE" = "gate" ]; then
         CFG_OPTIONS+=" --cfg-options model.backbone_cfg.transformer.encoder.transformerlayers.sat_gate_init=${SAT_GATE_INIT}"
@@ -111,6 +136,7 @@ if [ "$USE_CROSS_ATTN" = true ]; then
     fi
 else
     CFG_OPTIONS+=" --cfg-options model.sat_encoder_cfg=None"
+    echo "[Config] Satellite Encoder: OFF"
     echo "[Config] Cross-Attention (Early Fusion): OFF"
 fi
 
@@ -140,7 +166,8 @@ echo "============================================"
 echo " GPUs:          ${GPUS} (${NUM_GPUS} devices)"
 echo " Master Port:   ${MASTER_PORT}"
 echo " Config:        ${CONFIG}"
-echo " Cross-Attn:    ${USE_CROSS_ATTN} (mode=${SAT_FUSION_MODE}, gate=${SAT_GATE_INIT})"
+echo " Sat Encoder:   ${SAT_ENCODER}
+ Cross-Attn:    ${USE_CROSS_ATTN} (mode=${SAT_FUSION_MODE}, gate=${SAT_GATE_INIT})"
 echo " Conv Fusion:   ${USE_CONV_FUSION} (gate=${FUSION_GATE_INIT})"
 echo " Skeleton:      ${USE_SKELETON} (weight=${SKEL_WEIGHT})"
 echo " WandB:         ${WANDB_PROJECT} / ${WANDB_NAME}"

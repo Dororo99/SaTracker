@@ -147,21 +147,28 @@ class BEVFormerLayerWithSat(MyCustomBaseTransformerLayer):
                         if getattr(self, '_store_attn_map', False):
                             with torch.no_grad():
                                 attn_module = self.attentions[attn_index]
+                                num_heads = attn_module.attn.num_heads
+                                head_dim = attn_module.attn.embed_dim // num_heads
                                 q = query + bev_pos if bev_pos is not None else query
                                 k = sat_tokens + sat_pos if sat_pos is not None else sat_tokens
                                 if attn_module.batch_first:
                                     q = q.transpose(0, 1)
                                     k = k.transpose(0, 1)
-                                q = F.linear(q, attn_module.attn.in_proj_weight[:attn_module.attn.embed_dim],
-                                             attn_module.attn.in_proj_bias[:attn_module.attn.embed_dim] if attn_module.attn.in_proj_bias is not None else None)
-                                k = F.linear(k, attn_module.attn.in_proj_weight[attn_module.attn.embed_dim:2*attn_module.attn.embed_dim],
-                                             attn_module.attn.in_proj_bias[attn_module.attn.embed_dim:2*attn_module.attn.embed_dim] if attn_module.attn.in_proj_bias is not None else None)
-                                d = attn_module.attn.embed_dim // attn_module.attn.num_heads
-                                attn_weights = torch.bmm(
-                                    q.reshape(-1, q.size(1), d),
-                                    k.reshape(-1, k.size(1), d).transpose(1, 2)
-                                ) / (d ** 0.5)
-                                self._sat_attn_weights = attn_weights.softmax(dim=-1).mean(0)  # avg over heads+batch → (5000, 196)
+                                # q: (seq_q, bs, embed_dim), k: (seq_k, bs, embed_dim)
+                                w = attn_module.attn.in_proj_weight
+                                b = attn_module.attn.in_proj_bias
+                                q = F.linear(q, w[:attn_module.attn.embed_dim],
+                                             b[:attn_module.attn.embed_dim] if b is not None else None)
+                                k = F.linear(k, w[attn_module.attn.embed_dim:2*attn_module.attn.embed_dim],
+                                             b[attn_module.attn.embed_dim:2*attn_module.attn.embed_dim] if b is not None else None)
+                                seq_q, bs_q, _ = q.shape
+                                seq_k = k.shape[0]
+                                # (seq, bs, embed) → (bs*heads, seq, head_dim)
+                                q = q.reshape(seq_q, bs_q, num_heads, head_dim).permute(1, 2, 0, 3).reshape(bs_q * num_heads, seq_q, head_dim)
+                                k = k.reshape(seq_k, bs_q, num_heads, head_dim).permute(1, 2, 0, 3).reshape(bs_q * num_heads, seq_k, head_dim)
+                                attn_weights = torch.bmm(q, k.transpose(1, 2)) / (head_dim ** 0.5)
+                                # (bs*heads, 5000, 196) → avg over batch & heads → (5000, 196)
+                                self._sat_attn_weights = attn_weights.softmax(dim=-1).reshape(bs_q, num_heads, seq_q, seq_k).mean(dim=[0, 1])
 
                     attn_index += 1
                     cross_attn_count += 1

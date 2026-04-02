@@ -472,7 +472,7 @@ log_config = dict(
             init_kwargs=dict(
                 entity='IRCV_Mapping',
                 project='Third-SatMAE_MapTracker-AID4AD-seonghyun',
-                name='Third-SatMAE_MapTracker_sig_skeleton-AID4AD-seonghyun'
+                name='SaTracker-res18-skeleton'
             )
         )
     ])
