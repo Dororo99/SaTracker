@@ -13,16 +13,16 @@ set -e
 # ============================================================
 # Default settings
 # ============================================================
-GPUS="2,3"
+GPUS="0,1"
 NUM_GPUS=2
-MASTER_PORT=29570
+MASTER_PORT=29571
 USE_SKELETON=true
 SKEL_WEIGHT=1.0
 SKEL_CLASSES="[1,2]"
 BEV_VIS_INTERVAL=500
 WANDB_ENTITY="IRCV_Mapping"
 WANDB_PROJECT="Third-SatMAE_MapTracker-AID4AD-seonghyun"
-WANDB_NAME="Third-SatMAE_MapTracker_sig_skeleton-AID4AD-dohyun"
+WANDB_NAME="SatMAETracker_sig25_skeleton"
 CONFIG="plugin/configs/maptracker/nuscenes_newsplit/satmaptracker_stage1_bev_pretrain.py"
 
 # ============================================================

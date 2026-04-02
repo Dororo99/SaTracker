@@ -70,6 +70,20 @@ class WandbBEVVisHook(Hook):
         self.interval = interval
         self.vis_skeleton = vis_skeleton
 
+    def before_train_iter(self, runner):
+        """Enable attn map storage one iteration before visualization."""
+        if wandb is None or wandb.run is None:
+            return
+        # Flag on at (vis_iter - 1) so the next forward stores attn weights
+        if self.every_n_iters(runner, self.interval):
+            model = runner.model
+            if hasattr(model, 'module'):
+                model = model.module
+            if hasattr(model, 'backbone') and hasattr(model.backbone, 'transformer'):
+                for layer in model.backbone.transformer.encoder.layers:
+                    if hasattr(layer, 'sat_gate'):
+                        layer._store_attn_map = True
+
     def after_train_iter(self, runner):
         if wandb is None or wandb.run is None:
             return
@@ -79,6 +93,11 @@ class WandbBEVVisHook(Hook):
         model = runner.model
         if hasattr(model, 'module'):
             model = model.module
+
+        # Turn off attn map storage
+        if hasattr(model, 'backbone') and hasattr(model.backbone, 'transformer'):
+            for layer in model.backbone.transformer.encoder.layers:
+                layer._store_attn_map = False
 
         if not hasattr(model, '_vis_seg_preds'):
             return
@@ -120,5 +139,59 @@ class WandbBEVVisHook(Hook):
             diff_rgb = np.stack([diff, diff, diff], axis=-1)
             images['BEV/fusion_diff'] = wandb.Image(
                 diff_rgb, caption='Fusion Difference (bright=large change)')
+
+        # Satellite attention map visualization
+        if hasattr(model, '_vis_sat_attn_map'):
+            attn_map = model._vis_sat_attn_map  # (5000, 196)
+
+            # BEV-side: which satellite tokens each BEV query attends to
+            # Average over satellite dim → (5000,) → reshape to (50, 100)
+            bev_attn = attn_map.max(dim=1)[0]  # max attention per BEV query
+            bev_attn = bev_attn.reshape(50, 100).cpu().numpy()
+            bev_attn = (bev_attn - bev_attn.min()) / (bev_attn.max() - bev_attn.min() + 1e-8)
+            bev_attn = (bev_attn * 255).astype(np.uint8)
+            bev_attn_rgb = np.stack([bev_attn, bev_attn, bev_attn], axis=-1)
+            images['BEV/sat_attn_bev'] = wandb.Image(
+                bev_attn_rgb, caption='BEV attention to satellite (bright=high)')
+
+            # Satellite-side: which satellite tokens are most attended to
+            # Average over BEV dim → (196,) → reshape to (14, 14)
+            sat_attn = attn_map.mean(dim=0)  # avg attention received per sat token
+            sat_attn = sat_attn.reshape(14, 14).cpu().numpy()
+            sat_attn = (sat_attn - sat_attn.min()) / (sat_attn.max() - sat_attn.min() + 1e-8)
+            sat_attn = (sat_attn * 255).astype(np.uint8)
+            # Upsample for better visibility
+            from PIL import Image as PILImage
+            sat_attn_up = np.array(PILImage.fromarray(sat_attn).resize((100, 50), PILImage.BILINEAR))
+            sat_attn_rgb = np.stack([sat_attn_up, sat_attn_up, sat_attn_up], axis=-1)
+            images['BEV/sat_attn_sat'] = wandb.Image(
+                sat_attn_rgb, caption='Satellite tokens attention received (bright=popular)')
+
+            # Per-class attention distribution on satellite
+            if hasattr(model, '_vis_seg_preds'):
+                seg = model._vis_seg_preds[0].sigmoid()  # (C, 200, 100)
+                # Downsample seg to BEV query resolution (50, 100)
+                seg_down = torch.nn.functional.interpolate(
+                    seg.unsqueeze(0), size=(50, 100),
+                    mode='bilinear', align_corners=False)[0]  # (C, 50, 100)
+
+                cls_names = {0: 'ped_crossing', 1: 'divider', 2: 'boundary'}
+                for cls_idx in range(min(seg_down.shape[0], 3)):
+                    cls_mask = (seg_down[cls_idx] > 0.5).flatten()  # (5000,)
+                    if cls_mask.sum() < 10:
+                        continue
+                    # Attention of this class's BEV queries → satellite
+                    cls_attn = attn_map[cls_mask].mean(dim=0)  # (196,)
+                    cls_attn = cls_attn.reshape(14, 14).cpu().numpy()
+                    cls_attn = (cls_attn - cls_attn.min()) / (cls_attn.max() - cls_attn.min() + 1e-8)
+                    cls_attn = (cls_attn * 255).astype(np.uint8)
+                    cls_attn_up = np.array(PILImage.fromarray(cls_attn).resize((100, 50), PILImage.BILINEAR))
+                    # Colorize with class color
+                    color = CLASS_COLORS[cls_idx] / 255.0
+                    cls_attn_rgb = (np.stack([cls_attn_up] * 3, axis=-1) * color).astype(np.uint8)
+                    images[f'BEV/sat_attn_{cls_names[cls_idx]}'] = wandb.Image(
+                        cls_attn_rgb, caption=f'{cls_names[cls_idx]} → satellite attn')
+
+            del model._vis_sat_attn_map
 
         wandb.log(images, step=runner.iter)

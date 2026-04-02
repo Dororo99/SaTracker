@@ -134,6 +134,27 @@ class BEVFormerLayerWithSat(MyCustomBaseTransformerLayer):
                             attn_mask=attn_masks[attn_index])
                         gate = torch.sigmoid(self.sat_gate)
                         query = (1 - gate) * query + gate * sat_out
+
+                        # Store attention weights for visualization (no grad, no overhead at train)
+                        if getattr(self, '_store_attn_map', False):
+                            with torch.no_grad():
+                                attn_module = self.attentions[attn_index]
+                                q = query + bev_pos if bev_pos is not None else query
+                                k = sat_tokens + sat_pos if sat_pos is not None else sat_tokens
+                                if attn_module.batch_first:
+                                    q = q.transpose(0, 1)
+                                    k = k.transpose(0, 1)
+                                q = F.linear(q, attn_module.attn.in_proj_weight[:attn_module.attn.embed_dim],
+                                             attn_module.attn.in_proj_bias[:attn_module.attn.embed_dim] if attn_module.attn.in_proj_bias is not None else None)
+                                k = F.linear(k, attn_module.attn.in_proj_weight[attn_module.attn.embed_dim:2*attn_module.attn.embed_dim],
+                                             attn_module.attn.in_proj_bias[attn_module.attn.embed_dim:2*attn_module.attn.embed_dim] if attn_module.attn.in_proj_bias is not None else None)
+                                d = attn_module.attn.embed_dim // attn_module.attn.num_heads
+                                attn_weights = torch.bmm(
+                                    q.reshape(-1, q.size(1), d),
+                                    k.reshape(-1, k.size(1), d).transpose(1, 2)
+                                ) / (d ** 0.5)
+                                self._sat_attn_weights = attn_weights.softmax(dim=-1).mean(0)  # avg over heads+batch → (5000, 196)
+
                     attn_index += 1
                     cross_attn_count += 1
                     identity = query

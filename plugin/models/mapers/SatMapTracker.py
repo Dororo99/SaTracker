@@ -266,6 +266,15 @@ class SatMapTracker(MapTracker):
         if self.conv_fusion is not None:
             log_vars['conv_fusion_gate'] = torch.sigmoid(self.conv_fusion.gate).item()
 
+        # Store attention maps from encoder layers for visualization
+        if hasattr(self.backbone, 'transformer'):
+            encoder = self.backbone.transformer.encoder
+            for lid, layer in enumerate(encoder.layers):
+                if hasattr(layer, '_sat_attn_weights'):
+                    self._vis_sat_attn_map = layer._sat_attn_weights.detach()
+                    del layer._sat_attn_weights
+                    break  # take first layer only
+
         # Store BEV seg preds and GT for visualization hooks
         self._vis_seg_preds = seg_preds.detach()
         self._vis_gt_semantic = gt_semantic.detach()
