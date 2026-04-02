@@ -16,6 +16,26 @@ CLASS_COLORS = {
 }
 
 
+def _bev_feat_to_heatmap(feat_tensor):
+    """Convert (C, H, W) BEV feature to (H, W, 3) heatmap via L2 norm.
+
+    Args:
+        feat_tensor: (C, H, W) feature tensor.
+    Returns:
+        heatmap: (H, W, 3) uint8 numpy array (blue=low, red=high).
+    """
+    norm = feat_tensor.norm(dim=0).cpu().numpy()  # (H, W)
+    norm = (norm - norm.min()) / (norm.max() - norm.min() + 1e-8)
+    norm = (norm * 255).astype(np.uint8)
+
+    # Apply colormap: blue(low) -> green(mid) -> red(high)
+    heatmap = np.zeros((*norm.shape, 3), dtype=np.uint8)
+    heatmap[..., 0] = norm            # R
+    heatmap[..., 1] = 255 - norm      # G (inverse)
+    heatmap[..., 2] = 255 - norm      # B (inverse)
+    return heatmap
+
+
 def _seg_to_rgb(seg_tensor, threshold=0.5):
     """Convert (C, H, W) segmentation tensor to (H, W, 3) RGB image.
 
@@ -83,5 +103,22 @@ class WandbBEVVisHook(Hook):
             if gt_skel is not None:
                 skel_rgb = _seg_to_rgb(gt_skel[0].float())
                 images['BEV/skeleton_gt'] = wandb.Image(skel_rgb, caption='Skeleton GT')
+
+        # BEV feature before/after ConvFusion
+        if hasattr(model, '_vis_bev_pre_fusion') and hasattr(model, '_vis_bev_post_fusion'):
+            pre = model._vis_bev_pre_fusion[0]   # (C, H, W)
+            post = model._vis_bev_post_fusion[0]  # (C, H, W)
+            images['BEV/feat_pre_fusion'] = wandb.Image(
+                _bev_feat_to_heatmap(pre), caption='Before ConvFusion')
+            images['BEV/feat_post_fusion'] = wandb.Image(
+                _bev_feat_to_heatmap(post), caption='After ConvFusion')
+
+            # Difference heatmap (where fusion changed the most)
+            diff = (post - pre).norm(dim=0).cpu().numpy()
+            diff = (diff - diff.min()) / (diff.max() - diff.min() + 1e-8)
+            diff = (diff * 255).astype(np.uint8)
+            diff_rgb = np.stack([diff, diff, diff], axis=-1)
+            images['BEV/fusion_diff'] = wandb.Image(
+                diff_rgb, caption='Fusion Difference (bright=large change)')
 
         wandb.log(images, step=runner.iter)

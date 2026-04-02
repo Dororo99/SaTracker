@@ -12,6 +12,7 @@ import torch.nn as nn
 from mmdet3d.models.builder import build_backbone
 from .base_mapper import MAPPERS
 from .MapTracker import MapTracker
+from ..backbones.conv_fusion import SatConvFusion
 
 
 @MAPPERS.register_module()
@@ -19,6 +20,7 @@ class SatMapTracker(MapTracker):
 
     def __init__(self,
                  sat_encoder_cfg=None,
+                 conv_fusion_cfg=None,
                  **kwargs):
         super().__init__(**kwargs)
 
@@ -27,11 +29,21 @@ class SatMapTracker(MapTracker):
         else:
             self.sat_encoder = None
 
+        if conv_fusion_cfg is not None:
+            self.conv_fusion = SatConvFusion(**conv_fusion_cfg)
+        else:
+            self.conv_fusion = None
+
     def _encode_satellite(self, sat_img):
         if self.sat_encoder is None or sat_img is None:
             return None, None
         sat_tokens, grid_size = self.sat_encoder(sat_img)
         return sat_tokens, grid_size
+
+    def _apply_conv_fusion(self, bev_feats, sat_tokens, sat_grid_size):
+        if self.conv_fusion is not None and sat_tokens is not None:
+            return self.conv_fusion(bev_feats, sat_tokens, sat_grid_size)
+        return bev_feats
 
     def forward_train(self, img, vectors, semantic_mask, points=None,
                       img_metas=None, all_prev_data=None,
@@ -101,6 +113,11 @@ class SatMapTracker(MapTracker):
                 sat_tokens=sat_tokens_t, sat_grid_size=sat_grid_t)
 
             bev_feats = self.neck(_bev_feats)
+            if img_backbone_gradient:
+                bev_feats = self._apply_conv_fusion(bev_feats, sat_tokens_t, sat_grid_t)
+            else:
+                with torch.no_grad():
+                    bev_feats = self._apply_conv_fusion(bev_feats, sat_tokens_t, sat_grid_t)
 
             if _use_memory:
                 self.memory_bank.curr_t = t
@@ -181,6 +198,11 @@ class SatMapTracker(MapTracker):
             sat_tokens=sat_tokens, sat_grid_size=sat_grid)
 
         bev_feats = self.neck(_bev_feats)
+        if self.conv_fusion is not None:
+            self._vis_bev_pre_fusion = bev_feats.detach()
+        bev_feats = self._apply_conv_fusion(bev_feats, sat_tokens, sat_grid)
+        if self.conv_fusion is not None:
+            self._vis_bev_post_fusion = bev_feats.detach()
 
         if self.skip_vector_head or num_prev_frames == 0:
             assert track_query_info is None
@@ -241,6 +263,9 @@ class SatMapTracker(MapTracker):
                 if hasattr(layer, 'sat_gate'):
                     log_vars[f'sat_gate_L{lid}'] = torch.sigmoid(layer.sat_gate).item()
 
+        if self.conv_fusion is not None:
+            log_vars['conv_fusion_gate'] = torch.sigmoid(self.conv_fusion.gate).item()
+
         # Store BEV seg preds and GT for visualization hooks
         self._vis_seg_preds = seg_preds.detach()
         self._vis_gt_semantic = gt_semantic.detach()
@@ -289,6 +314,7 @@ class SatMapTracker(MapTracker):
             sat_tokens=sat_tokens, sat_grid_size=sat_grid)
 
         bev_feats = self.neck(_bev_feats)
+        bev_feats = self._apply_conv_fusion(bev_feats, sat_tokens, sat_grid)
 
         if self.skip_vector_head or first_frame:
             self.temporal_propagate(bev_feats, img_metas, all_history_curr2prev,

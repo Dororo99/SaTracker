@@ -101,6 +101,13 @@ model = dict(
         pretrained='./pretrained/satmae_fmow_pretrain.pth',
         frozen=True,
     ),
+    # ===== Conv Fusion (late fusion after BEV extraction) =====
+    conv_fusion_cfg=dict(
+        in_channels=bev_embed_dims,
+        sat_grid_size=14,
+        bev_size=(bev_h, bev_w),
+        gate_init=-1.0,
+    ),
     # ===== BEV backbone with Satellite Cross-Attention =====
     backbone_cfg=dict(
         type='SatBEVFormerBackbone',
