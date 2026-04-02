@@ -120,3 +120,38 @@ class SatCamConvFusion(nn.Module):
         concat = torch.cat([self.proj_cam(cam_bev), self.proj_sat(sat_bev)], dim=1)
         fused = self.fuse(concat) + cam_bev
         return fused, {}
+
+
+@NECKS.register_module()
+class SatelliteConvFuser(nn.Module):
+    """SatMap-style ConvFuser: concat + conv fusion (BEVFusion baseline).
+
+    No residual connection. Projects both modalities, concatenates,
+    then processes through conv blocks.
+
+    Reference: SatMap (arXiv:2601.10512), BEVFusion (ICRA 2023)
+
+    Args:
+        in_channels (int): Input channels per modality.
+        hidden_channels (int): Hidden channels in conv blocks.
+    """
+
+    def __init__(self, in_channels=256, hidden_channels=256):
+        super().__init__()
+        self.proj_cam = nn.Conv2d(in_channels, hidden_channels, 1, bias=False)
+        self.proj_sat = nn.Conv2d(in_channels, hidden_channels, 1, bias=False)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(hidden_channels * 2, hidden_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, in_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, cam_bev, sat_bev):
+        cam_proj = self.proj_cam(cam_bev)
+        sat_proj = self.proj_sat(sat_bev)
+        concat = torch.cat([cam_proj, sat_proj], dim=1)
+        fused = self.fuse(concat)
+        return fused, {}

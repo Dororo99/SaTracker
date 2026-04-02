@@ -1,2 +1,3 @@
 from .bevformer_backbone import BEVFormerBackbone
 from .satellite_encoder import SatelliteEncoder
+from .simple_satellite_encoder import SimpleSatEncoder

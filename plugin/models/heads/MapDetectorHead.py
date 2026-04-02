@@ -134,6 +134,7 @@ class MapDetectorHead(nn.Module):
                  sd_attr_dim=4,
                  sd_tag_dim=2,
                  use_sd_queries=False,
+                 use_sat_cross_attn=False,
                 ):
         super().__init__()
         self.num_queries = num_queries
@@ -150,7 +151,8 @@ class MapDetectorHead(nn.Module):
         self.sd_attr_dim = sd_attr_dim
         self.sd_tag_dim = sd_tag_dim
         self.use_sd_queries = use_sd_queries
-        
+        self.use_sat_cross_attn = use_sat_cross_attn
+
         self.sync_cls_avg_factor = sync_cls_avg_factor
         self.bg_cls_weight = bg_cls_weight
         
@@ -239,6 +241,10 @@ class MapDetectorHead(nn.Module):
         """Initialize classification branch and regression branch of head."""
         self.input_proj = Conv2d(
             self.in_channels, self.embed_dims, kernel_size=1)
+
+        if self.use_sat_cross_attn:
+            self.sat_input_proj = Conv2d(
+                self.in_channels, self.embed_dims, kernel_size=1)
 
         cls_branch = Linear(self.embed_dims, self.cls_out_channels)
 
@@ -546,6 +552,16 @@ class MapDetectorHead(nn.Module):
         _sd_mask = sd_prior_mask if sd_prior_mask is not None else sd_ca_mask
         _sd_coords = sd_prior_coords  # only for new SD prior path
 
+        # Satellite BEV features (passed via instance attribute from SatMapTracker)
+        sat_kwargs = {}
+        if self.use_sat_cross_attn and getattr(self, '_sat_bev_features', None) is not None:
+            sat_bev = self._sat_bev_features
+            B_sat, C_sat, H_sat, W_sat = sat_bev.shape
+            sat_mask = sat_bev.new_zeros(B_sat, H_sat, W_sat)
+            sat_pos = self.bev_pos_embed(sat_mask)
+            sat_bev_proj = self.sat_input_proj(sat_bev) + sat_pos
+            sat_kwargs['sat_bev_feats'] = sat_bev_proj
+
         # outs_dec: (num_layers, num_qs, bs, embed_dims)
         inter_queries, init_reference, inter_references = self.transformer(
             mlvl_feats=[bev_features,],
@@ -562,6 +578,7 @@ class MapDetectorHead(nn.Module):
             sd_features=_sd_features,
             sd_key_padding_mask=_sd_mask,
             sd_coords=_sd_coords,
+            **sat_kwargs,
         )
 
         outputs = []
@@ -756,6 +773,16 @@ class MapDetectorHead(nn.Module):
         _sd_mask = sd_prior_mask if sd_prior_mask is not None else sd_ca_mask_test
         _sd_coords = sd_prior_coords
 
+        # Satellite BEV features (passed via instance attribute from SatMapTracker)
+        sat_kwargs_test = {}
+        if self.use_sat_cross_attn and getattr(self, '_sat_bev_features', None) is not None:
+            sat_bev = self._sat_bev_features
+            B_sat, C_sat, H_sat, W_sat = sat_bev.shape
+            sat_mask = sat_bev.new_zeros(B_sat, H_sat, W_sat)
+            sat_pos = self.bev_pos_embed(sat_mask)
+            sat_bev_proj = self.sat_input_proj(sat_bev) + sat_pos
+            sat_kwargs_test['sat_bev_feats'] = sat_bev_proj
+
         # outs_dec: (num_layers, num_qs, bs, embed_dims)
         inter_queries, init_reference, inter_references = self.transformer(
             mlvl_feats=[bev_features,],
@@ -772,6 +799,7 @@ class MapDetectorHead(nn.Module):
             sd_features=_sd_features,
             sd_key_padding_mask=_sd_mask,
             sd_coords=_sd_coords,
+            **sat_kwargs_test,
         )
 
         outputs = []

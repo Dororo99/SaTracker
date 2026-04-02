@@ -52,7 +52,7 @@ log_config = dict(
         dict(type='WandbLoggerHook',
              init_kwargs=dict(
                  entity='IRCV_Mapping',
-                 project='Third-sdmaptracker-newcaching-kyungmin',
+                 project='Third-maptracker-kyungmin',
                  name='stage1_nosd_baseline',
              )),
     ])

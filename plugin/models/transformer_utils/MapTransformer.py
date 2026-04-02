@@ -82,6 +82,10 @@ class MapTransformerDecoder_new(BaseModule):
                 sd_features=None,
                 sd_key_padding_mask=None,
                 sd_coords=None,
+                sat_value=None,
+                sat_key_padding_mask=None,
+                sat_spatial_shapes=None,
+                sat_level_start_index=None,
                 **kwargs):
         """Forward function for `TransformerDecoder`.
         Args:
@@ -128,6 +132,11 @@ class MapTransformerDecoder_new(BaseModule):
                 reference_points_orig=reference_points,
                 sd_key_pos=sd_key_pos,
                 sd_pos_proj=self.sd_pos_proj if self.use_sd_prior else None,
+                # Satellite cross-attention
+                sat_value=sat_value,
+                sat_key_padding_mask=sat_key_padding_mask,
+                sat_spatial_shapes=sat_spatial_shapes,
+                sat_level_start_index=sat_level_start_index,
                 **kwargs)
             
             reg_points = reg_branches[lid](output.permute(1, 0, 2)) # (bs, num_q, 2*num_points)
@@ -206,6 +215,8 @@ class MapTransformerLayer(BaseTransformerLayer):
                  batch_first=False,
                  use_sd_cross_attn=False,
                  sd_cross_attn_cfg=None,
+                 use_sat_cross_attn=False,
+                 sat_cross_attn_cfg=None,
                  **kwargs):
 
         super().__init__(
@@ -234,6 +245,23 @@ class MapTransformerLayer(BaseTransformerLayer):
             self.sd_cross_attn = build_attention(sd_cross_attn_cfg)
             self.sd_cross_attn_norm = build_norm_layer(norm_cfg, self.embed_dims)[1]
 
+        # Satellite Cross-Attention: deformable attn over satellite BEV features
+        self.use_sat_cross_attn = use_sat_cross_attn
+        if use_sat_cross_attn:
+            if sat_cross_attn_cfg is None:
+                embed_dims = self.embed_dims
+                sat_cross_attn_cfg = dict(
+                    type='CustomMSDeformableAttention',
+                    embed_dims=embed_dims,
+                    num_heads=8,
+                    num_levels=1,
+                    num_points=20,
+                    dropout=0.1,
+                )
+            from mmcv.cnn.bricks.transformer import build_attention
+            self.sat_cross_attn = build_attention(sat_cross_attn_cfg)
+            self.sat_cross_attn_norm = build_norm_layer(norm_cfg, self.embed_dims)[1]
+
     def forward(self,
                 query,
                 key=None,
@@ -250,6 +278,10 @@ class MapTransformerLayer(BaseTransformerLayer):
                 reference_points_orig=None,
                 sd_key_pos=None,
                 sd_pos_proj=None,
+                sat_value=None,
+                sat_key_padding_mask=None,
+                sat_spatial_shapes=None,
+                sat_level_start_index=None,
                 **kwargs):
         """Forward function for `TransformerDecoderLayer`.
 
@@ -343,6 +375,23 @@ class MapTransformerLayer(BaseTransformerLayer):
                         key_padding_mask=key_padding_mask,
                         **kwargs)
                     attn_index += 1
+
+                    # Satellite cross-attention: deformable attn over satellite BEV
+                    if self.use_sat_cross_attn and sat_value is not None:
+                        query_sat = self.sat_cross_attn(
+                            query_bev,
+                            sat_value,
+                            sat_value,
+                            identity if self.pre_norm else None,
+                            query_pos=query_pos,
+                            key_pos=None,
+                            attn_mask=None,
+                            key_padding_mask=sat_key_padding_mask,
+                            reference_points=kwargs.get('reference_points'),
+                            spatial_shapes=sat_spatial_shapes,
+                            level_start_index=sat_level_start_index,
+                        )
+                        query_bev = self.sat_cross_attn_norm(query_bev + query_sat)
 
                     # SD cross-attention: after BEV, before memory
                     # Uses per-point coords for key_pos, original (non-flipped) ref_points for query_pos
@@ -538,6 +587,25 @@ class MapTransformer(Transformer):
         sd_key_padding_mask = kwargs.pop('sd_key_padding_mask', None)
         sd_coords = kwargs.pop('sd_coords', None)
 
+        # Extract satellite BEV features from kwargs if present
+        sat_bev_feats = kwargs.pop('sat_bev_feats', None)
+        sat_kwargs = {}
+        if sat_bev_feats is not None:
+            bs_sat, c_sat, h_sat, w_sat = sat_bev_feats.shape
+            sat_feat_flatten = sat_bev_feats.flatten(2).transpose(1, 2)  # [B, H*W, C]
+            sat_feat_flatten = sat_feat_flatten.permute(1, 0, 2)  # [H*W, B, C]
+            sat_spatial_shapes = torch.tensor(
+                [[h_sat, w_sat]], dtype=torch.long, device=sat_bev_feats.device)
+            sat_level_start_index = torch.tensor(
+                [0], dtype=torch.long, device=sat_bev_feats.device)
+            sat_mask = sat_bev_feats.new_zeros((bs_sat, h_sat * w_sat)).bool()
+            sat_kwargs = dict(
+                sat_value=sat_feat_flatten,
+                sat_key_padding_mask=sat_mask,
+                sat_spatial_shapes=sat_spatial_shapes,
+                sat_level_start_index=sat_level_start_index,
+            )
+
         inter_states, inter_references = self.decoder(
             query=query,
             key=None,
@@ -554,6 +622,7 @@ class MapTransformer(Transformer):
             sd_features=sd_features,
             sd_key_padding_mask=sd_key_padding_mask,
             sd_coords=sd_coords,
+            **sat_kwargs,
             **kwargs)
         
         return inter_states, init_reference_points, inter_references

@@ -227,6 +227,11 @@ class BaseMapDataset(Dataset):
                 # save the extra semantic info
                 if save_semantic:
                     single_case['semantic_mask'] = pred['semantic_mask'].tolist()
+                    # Save cam/sat variants if present
+                    if 'semantic_mask_cam' in pred:
+                        single_case['semantic_mask_cam'] = pred['semantic_mask_cam'].tolist()
+                    if 'semantic_mask_sat' in pred:
+                        single_case['semantic_mask_sat'] = pred['semantic_mask_sat'].tolist()
 
                 if 'scores' in pred:
                     for i in range(len(pred['scores'])):

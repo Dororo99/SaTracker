@@ -159,6 +159,10 @@ class MapTracker(BaseMapper):
             except AttributeError:
                 pass
 
+    def _post_backbone_hook(self, bev_feats):
+        """Hook for subclasses to modify BEV features after backbone, before neck."""
+        return bev_feats
+
     def _encode_osm_tile(self, osm_tile):
         """Encode OSM tile image to feature map. Returns None if not applicable."""
         if not self.use_osm_tile or osm_tile is None:
@@ -588,6 +592,7 @@ class MapTracker(BaseMapper):
                         history_img_metas, all_history_coord, points=None,
                         img_backbone_gradient=img_backbone_gradient, tile_feat=prev_tile_feat,
                         tile_active=_tile_active)
+            _bev_feats = self._post_backbone_hook(_bev_feats)
 
             # Neck for prev
             bev_feats = self.neck(_bev_feats)
@@ -707,6 +712,7 @@ class MapTracker(BaseMapper):
         _bev_feats, mlvl_feats = self.backbone(img, img_metas, num_prev_frames, history_bev_feats, history_img_metas, all_history_coord,
                     points=None, img_backbone_gradient=img_backbone_gradient, tile_feat=curr_tile_feat,
                     tile_active=_tile_active)
+        _bev_feats = self._post_backbone_hook(_bev_feats)
         # Neck for curr
         bev_feats = self.neck(_bev_feats)
 
@@ -843,6 +849,7 @@ class MapTracker(BaseMapper):
         _bev_feats, mlvl_feats = self.backbone(img, img_metas, local_idx, history_bev_feats, history_img_metas,
                         all_history_coord, points=points, tile_feat=tile_feat,
                         tile_active=self.use_osm_tile)
+        _bev_feats = self._post_backbone_hook(_bev_feats)
 
         img_shape = [_bev_feats.shape[2:] for i in range(_bev_feats.shape[0])]
         # Neck
@@ -1256,7 +1263,7 @@ class MapTracker(BaseMapper):
 
             sorted_indices = np.argsort(dists)
             sorted_dists = dists[sorted_indices]
-            covered = np.zeros_like(sorted_indices).astype(np.bool)
+            covered = np.zeros_like(sorted_indices).astype(bool)
             selected_ids = []
             for dist_range in self.mem_select_dist_ranges[::-1]:
                 outter_valid_flags = (sorted_dists >= dist_range) & ~covered

@@ -1,14 +1,10 @@
 """
-SatMapTracker Stage 3: Joint Finetuning with Satellite Fusion
+SatMapTracker Stage 1: BEV Pretrain with Satellite Fusion
 
-Fusion module is introduced here. Camera BEV + Satellite BEV → fused BEV.
-All components trained with differentiated learning rates:
-  - Camera backbone: 0.1x (already converged)
-  - Satellite encoder: 0.1x (already converged from Stage 1)
-  - BEV transformer/neck: 0.5x
-  - Fusion module: 1.0x (new, needs to learn)
-  - Vector head: 1.0x
-  - Seg decoder: 0.5x
+Fusion: SatelliteConvFuser (concat + conv, no residual)
+Triple supervision: cam_bev, sat_bev, fused_bev through shared seg_decoder
+History: fused_bev (per-frame aligned satellite)
+Encoder: SatelliteEncoder (ResNet50 + FPN)
 """
 
 _base_ = [
@@ -19,28 +15,37 @@ type = 'Mapper'
 plugin = True
 plugin_dir = 'plugin/'
 
+# ── Image configs ──
 img_norm_cfg = dict(
     mean=[103.530, 116.280, 123.675], std=[1.0, 1.0, 1.0], to_rgb=False)
 img_h = 480
 img_w = 800
 img_size = (img_h, img_w)
+num_cams = 6
 
-num_gpus = 4
-batch_size = 4
+num_gpus = 2
+batch_size = 3
 num_iters_per_epoch = 27846 // (num_gpus * batch_size)
-num_epochs = 36
+num_epochs = 18
 num_epochs_interval = num_epochs // 6
 total_iters = num_epochs * num_iters_per_epoch
 num_queries = 100
 
-cat2id = {'ped_crossing': 0, 'divider': 1, 'boundary': 2}
+# ── Category configs ──
+cat2id = {
+    'ped_crossing': 0,
+    'divider': 1,
+    'boundary': 2,
+}
 num_class = max(list(cat2id.values())) + 1
 
+# ── BEV configs ──
 roi_size = (60, 30)
 bev_h = 50
 bev_w = 100
 pc_range = [-roi_size[0]/2, -roi_size[1]/2, -3, roi_size[0]/2, roi_size[1]/2, 5]
 
+# ── Vector / raster params ──
 coords_dim = 2
 sample_dist = -1
 sample_num = -1
@@ -52,6 +57,7 @@ meta = dict(
     use_lidar=False, use_camera=True, use_radar=False,
     use_map=False, use_external=False, output_format='vector')
 
+# ── Model dims ──
 bev_embed_dims = 256
 embed_dims = 512
 num_feat_levels = 3
@@ -70,15 +76,15 @@ model = dict(
     history_steps=4,
     test_time_history_steps=20,
     mem_select_dist_ranges=[1, 5, 10, 15],
-    skip_vector_head=False,
-    freeze_bev=False,           # Everything trainable
+    skip_vector_head=True,      # Stage 1: BEV pretrain only
+    freeze_bev=False,
     track_fp_aug=False,
-    use_memory=True,
+    use_memory=False,
     mem_len=4,
-    mem_warmup_iters=-1,        # Memory immediately active
-    # ── Satellite: fusion enabled ──
-    use_sat_fusion=True,        # Fusion active!
-    freeze_sat_encoder=False,   # Satellite encoder fine-tuned
+    mem_warmup_iters=500,
+    # ── Satellite fusion ──
+    history_mode='fused',       # 'fused' or 'cam' for ablation
+    freeze_sat_encoder=False,
     sat_encoder_cfg=dict(
         type='SatelliteEncoder',
         backbone_cfg=dict(
@@ -96,12 +102,10 @@ model = dict(
         out_channels=bev_embed_dims,
         bev_size=(bev_h, bev_w),
     ),
-    # Fusion module: choose one of SatCamModulation / SatCamGatedFusion / SatCamConvFusion
     sat_fusion_cfg=dict(
-        type='SatCamModulation',
+        type='SatelliteConvFuser',
         in_channels=bev_embed_dims,
-        hidden_dim=128,
-        use_residual=True,
+        hidden_channels=bev_embed_dims,
     ),
     # ── Camera backbone (same as MapTracker) ──
     backbone_cfg=dict(
@@ -109,8 +113,8 @@ model = dict(
         roi_size=roi_size,
         bev_h=bev_h,
         bev_w=bev_w,
-        history_steps=4,
         use_grid_mask=True,
+        history_steps=4,
         img_backbone=dict(
             type='ResNet',
             with_cp=False,
@@ -216,6 +220,7 @@ model = dict(
                       reg_cost=dict(type='LinesL1Cost', weight=50.0,
                                     beta=0.01, permute=permute))),
     ),
+    # ── Shared seg decoder (used for cam/sat/fused triple supervision) ──
     seg_cfg=dict(
         type='MapSegHead',
         num_classes=num_class,
@@ -226,10 +231,10 @@ model = dict(
         loss_seg=dict(type='MaskFocalLoss', use_sigmoid=True, loss_weight=10.0),
         loss_dice=dict(type='MaskDiceLoss', loss_weight=1.0),
     ),
-    model_name='SatMapTracker_Stage3',
+    model_name='SatMapTracker_Stage1',
 )
 
-# ── Data pipeline WITH satellite for Stage 3 ──
+# ── Data pipeline with AID4AD satellite loading ──
 train_pipeline = [
     dict(type='VectorizeMap', coords_dim=coords_dim, roi_size=roi_size,
          sample_num=num_points, normalize=True, permute=permute),
@@ -237,7 +242,7 @@ train_pipeline = [
          canvas_size=canvas_size, thickness=thickness, semantic_mask=True),
     dict(type='LoadMultiViewImagesFromFiles', to_float32=True),
     dict(type='LoadAID4ADSatelliteImage',
-         data_root=aid4ad_root, canvas_size=None, normalize=True),  # original 400x200
+         data_root=aid4ad_root, canvas_size=None, normalize=True),
     dict(type='PhotoMetricDistortionMultiViewImage'),
     dict(type='ResizeMultiViewImages', size=img_size, change_intrinsics=True),
     dict(type='Normalize3D', **img_norm_cfg),
@@ -250,17 +255,15 @@ train_pipeline = [
                     'img_shape', 'scene_name')),
 ]
 
-# Test: satellite도 포함 (fusion 활성화이므로)
 test_pipeline = [
     dict(type='LoadMultiViewImagesFromFiles', to_float32=True),
     dict(type='LoadAID4ADSatelliteImage',
-         data_root=aid4ad_root, canvas_size=None, normalize=True),  # original 400x200
+         data_root=aid4ad_root, canvas_size=None, normalize=True),
     dict(type='ResizeMultiViewImages', size=img_size, change_intrinsics=True),
     dict(type='Normalize3D', **img_norm_cfg),
     dict(type='PadMultiViewImages', size_divisor=32),
     dict(type='FormatBundleMap'),
-    dict(type='Collect3D',
-         keys=['img', 'sat_img'],
+    dict(type='Collect3D', keys=['img', 'sat_img'],
          meta_keys=('token', 'ego2img', 'sample_idx',
                     'ego2global_translation', 'ego2global_rotation',
                     'img_shape', 'scene_name')),
@@ -274,8 +277,10 @@ eval_config = dict(
     pipeline=[
         dict(type='VectorizeMap', coords_dim=coords_dim, simplify=True,
              normalize=False, roi_size=roi_size),
+        dict(type='RasterizeMap', roi_size=roi_size, coords_dim=coords_dim,
+             canvas_size=canvas_size, thickness=thickness, semantic_mask=True),
         dict(type='FormatBundleMap'),
-        dict(type='Collect3D', keys=['vectors'],
+        dict(type='Collect3D', keys=['vectors', 'semantic_mask'],
              meta_keys=['token', 'ego2img', 'sample_idx',
                         'ego2global_translation', 'ego2global_rotation',
                         'img_shape', 'scene_name']),
@@ -295,9 +300,11 @@ match_config = dict(
              canvas_size=canvas_size, thickness=thickness),
         dict(type='FormatBundleMap'),
         dict(type='Collect3D', keys=['vectors', 'semantic_mask'],
-             meta_keys=['token', 'ego2img', 'sample_idx',
+             meta_keys=['token', 'ego2img', 'ego2cam', 'sample_idx',
                         'ego2global_translation', 'ego2global_rotation',
-                        'img_shape', 'scene_name']),
+                        'img_shape', 'scene_name', 'img_filenames',
+                        'cam_intrinsics', 'cam_extrinsics',
+                        'lidar2ego_translation', 'lidar2ego_rotation']),
     ],
     interval=1,
 )
@@ -320,7 +327,7 @@ data = dict(
         meta=meta, roi_size=roi_size, cat2id=cat2id,
         pipeline=test_pipeline,
         eval_config=eval_config,
-        test_mode=True, seq_split_num=1),
+        test_mode=True, seq_split_num=1, eval_semantic=True),
     test=dict(
         type='NuscDataset',
         data_root='./datasets/nuscenes',
@@ -328,28 +335,18 @@ data = dict(
         meta=meta, roi_size=roi_size, cat2id=cat2id,
         pipeline=test_pipeline,
         eval_config=eval_config,
-        test_mode=True, seq_split_num=1),
+        test_mode=True, seq_split_num=1, eval_semantic=True),
     shuffler_sampler=dict(type='DistributedGroupSampler'),
     nonshuffler_sampler=dict(type='DistributedSampler'),
 )
 
-# ── Optimizer with differentiated LRs ──
+# ── Optimizer ──
 optimizer = dict(
     type='AdamW',
     lr=5e-4,
     paramwise_cfg=dict(
         custom_keys={
-            # Camera backbone: small LR (already converged)
-            'backbone.img_backbone': dict(lr_mult=0.1),
-            'backbone.img_neck': dict(lr_mult=0.5),
-            'backbone.transformer': dict(lr_mult=0.5),
-            'backbone.positional_encoding': dict(lr_mult=0.5),
-            # Satellite encoder: small LR (already converged from Stage 1)
-            'sat_encoder': dict(lr_mult=0.1),
-            # Seg decoder: medium LR
-            'seg_decoder': dict(lr_mult=0.5),
-            # Fusion module (inside neck wrapper): full LR (new, needs to learn)
-            # 'neck.fusion_module' uses default lr_mult=1.0
+            'img_backbone': dict(lr_mult=0.1),
         }),
     weight_decay=1e-2)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
@@ -359,7 +356,7 @@ lr_config = dict(
     warmup='linear',
     warmup_iters=500,
     warmup_ratio=1.0 / 3,
-    min_lr_ratio=3e-3)
+    min_lr_ratio=5e-2)
 
 evaluation = dict(interval=num_epochs_interval*num_iters_per_epoch)
 find_unused_parameters = True
@@ -376,11 +373,9 @@ log_config = dict(
         dict(type='WandbLoggerHook',
              init_kwargs=dict(
                  entity='IRCV_Mapping',
-                 project='Third-SatMapTracker-Seperate-AID4AD-Kyungmin',
-                 name='stage3',
+                 project='Third-SatFuse-AID4AD-Kyungmin',
+                 name='satmaptracker-stage1-full',
              )),
     ])
 
 SyncBN = True
-
-load_from = "work_dirs/satmaptracker_stage2_warmup/latest.pth"

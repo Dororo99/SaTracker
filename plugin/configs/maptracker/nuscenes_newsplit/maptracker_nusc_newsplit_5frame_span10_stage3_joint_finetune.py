@@ -449,7 +449,7 @@ log_config = dict(
         dict(type='WandbLoggerHook',
              init_kwargs=dict(
                  entity='IRCV_Mapping',
-                 project='sdmaptracker',
+                 project='maptracker',
                  name='newsplit-stage3_joint_finetune',
              )),
     ])
