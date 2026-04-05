@@ -1,0 +1,106 @@
+_wandb:
+    value:
+        cli_version: 0.24.2
+        e:
+            oub4d4ie0b033xdxkjrgkx1t88to6yox:
+                args:
+                    - --local_rank=0
+                    - plugin/configs/maptracker/nuscenes_newsplit/satmaptracker_stage1_bev_pretrain.py
+                    - --launcher
+                    - pytorch
+                    - --cfg-options
+                    - model.seg_cfg.loss_skel.type=SkelRecallLoss
+                    - model.seg_cfg.loss_skel.loss_weight=1.0
+                    - model.seg_cfg.loss_skel.skel_classes=[1,2]
+                    - model.sat_encoder_cfg._delete_=True
+                    - model.sat_encoder_cfg.type=SatelliteEncoder
+                    - model.sat_encoder_cfg.out_channels=256
+                    - model.sat_encoder_cfg.token_grid_size=14
+                    - model.sat_encoder_cfg.frozen=False
+                    - model.sat_encoder_cfg.backbone_cfg.type=ResNet
+                    - model.sat_encoder_cfg.backbone_cfg.depth=50
+                    - model.sat_encoder_cfg.backbone_cfg.num_stages=4
+                    - model.sat_encoder_cfg.backbone_cfg.out_indices=[0,1,2,3]
+                    - model.sat_encoder_cfg.backbone_cfg.frozen_stages=-1
+                    - model.sat_encoder_cfg.backbone_cfg.norm_cfg.type=BN2d
+                    - model.sat_encoder_cfg.backbone_cfg.norm_eval=True
+                    - model.sat_encoder_cfg.backbone_cfg.style=pytorch
+                    - model.backbone_cfg.transformer.encoder.transformerlayers.sat_fusion_mode=add
+                    - model.conv_fusion_cfg=None
+                    - log_config.hooks.1.init_kwargs.entity=IRCV_Mapping
+                    - log_config.hooks.1.init_kwargs.project=Third-SatMAE_MapTracker-AID4AD-seonghyun
+                    - log_config.hooks.1.init_kwargs.name=SatMAETracker_sig25_skeleton_add
+                    - custom_hooks.0.interval=500
+                codePath: tools/train.py
+                codePathLocal: tools/train.py
+                cpu_count: 64
+                cpu_count_logical: 128
+                cudaVersion: "12.8"
+                disk:
+                    /:
+                        total: "3800427847680"
+                        used: "2952539242496"
+                email: ldh991014@hanyang.ac.kr
+                executable: /home/dohyun/miniconda3/envs/maptracker/bin/python
+                git:
+                    commit: 5cfff9d2581b679821c27c6ff59342dba78d049f
+                    remote: https://github.com/Dororo99/SaTracker.git
+                gpu: NVIDIA RTX A6000
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 10752
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX A6000
+                      uuid: GPU-1fbba5a5-55e2-7ec8-eac3-b957da37b3dc
+                    - architecture: Ampere
+                      cudaCores: 10752
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX A6000
+                      uuid: GPU-23d2de21-bdc6-9cb5-b869-7d4d39f02c6b
+                    - architecture: Ampere
+                      cudaCores: 10752
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX A6000
+                      uuid: GPU-4c413068-fd94-e358-5513-992616aabfca
+                    - architecture: Ampere
+                      cudaCores: 10752
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX A6000
+                      uuid: GPU-3b1ec938-8f09-bdbd-58e8-844eaf2551d1
+                host: neo
+                memory:
+                    total: "540697255936"
+                os: Linux-5.15.0-170-generic-x86_64-with-glibc2.17
+                program: tools/train.py
+                python: CPython 3.8.20
+                root: /home/dohyun/e2e/SaTracker
+                startedAt: "2026-04-03T05:52:55.180908Z"
+                writerId: oub4d4ie0b033xdxkjrgkx1t88to6yox
+        m: []
+        python_version: 3.8.20
+        t:
+            "1":
+                - 1
+                - 5
+                - 37
+                - 38
+                - 41
+                - 53
+                - 60
+            "2":
+                - 1
+                - 5
+                - 37
+                - 38
+                - 41
+                - 53
+                - 60
+            "3":
+                - 2
+                - 13
+                - 61
+            "4": 3.8.20
+            "5": 0.24.2
+            "12": 0.24.2
+            "13": linux-x86_64

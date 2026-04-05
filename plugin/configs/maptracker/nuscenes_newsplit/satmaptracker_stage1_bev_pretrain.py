@@ -69,7 +69,7 @@ num_points = 20
 permute = True
 
 # satellite configs
-sat_root = '/workspace/sumin/2026.Online-Mapping.for-NeurIPS-2026/datasets/nuscenes/AID4AD_frames'
+sat_root = '/home/dohyun/e2e/SaTracker/datasets/nuscenes/AID4AD_frames'
 sat_img_size = (200, 100)
 
 model = dict(
@@ -320,7 +320,11 @@ train_pipeline = [
         thickness=thickness,
         semantic_mask=True,
     ),
-    dict(type='SkeletonizeMap', skel_classes=[1, 2], num_dilations=2),
+    dict(
+        type='SkeletonizeMap',
+        skel_classes=[1, 2],
+        num_dilations=1,  # options: 0, 1, 2
+    ),
     dict(type='LoadMultiViewImagesFromFiles', to_float32=True),
     dict(type='LoadAID4ADSatelliteImage',
          sat_root=sat_root,
@@ -472,7 +476,7 @@ log_config = dict(
             init_kwargs=dict(
                 entity='IRCV_Mapping',
                 project='Third-SatMAE_MapTracker-AID4AD-seonghyun',
-                name='SaTracker-res18-skeleton'
+                name='SaTracker-res18-skeleton-dil=1'
             )
         )
     ])

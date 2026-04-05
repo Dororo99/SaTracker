@@ -34,4 +34,10 @@ pip install -e .
 pip install -r requirements.txt
 ```
 
+If you see `TypeError: FormatCode() got an unexpected keyword argument 'verify'`
+from MMCV config dump, reinstall yapf to the compatible version:
+
+```
+pip install --force-reinstall yapf==0.32.0
+```
 

@@ -156,4 +156,6 @@ mmdetection3d
 work_dirs
 vis_global
 vis_local
-
+.omc
+.omx
+.wandb
