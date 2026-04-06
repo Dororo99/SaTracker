@@ -59,8 +59,9 @@ def py_sigmoid_focal_loss(pred,
 
 @LOSSES.register_module()
 class MaskFocalLoss(FocalLoss):
-    def __init__(self,**kwargs):
+    def __init__(self, class_weights=None, **kwargs):
         super(MaskFocalLoss, self).__init__(**kwargs)
+        self.class_weights = [float(w) for w in class_weights] if class_weights is not None else None
     
     def forward(self, 
                 pred, 
@@ -77,7 +78,7 @@ class MaskFocalLoss(FocalLoss):
         num_classes = pred.size(1)
         loss = 0
         for index in range(num_classes):
-            loss += self.loss_weight * py_sigmoid_focal_loss(
+            cls_loss = py_sigmoid_focal_loss(
                 pred[:,index],
                 target[:,index],
                 weight,
@@ -85,6 +86,9 @@ class MaskFocalLoss(FocalLoss):
                 alpha=self.alpha,
                 reduction=reduction,
                 avg_factor=avg_factor)
+            if self.class_weights is not None and index < len(self.class_weights):
+                cls_loss = cls_loss * self.class_weights[index]
+            loss += cls_loss
 
         loss /= num_classes
         return loss * self.loss_weight
@@ -167,3 +171,165 @@ class SkelRecallLoss(nn.Module):
             loss = loss / num_valid
 
         return self.loss_weight * loss
+
+
+def _lovasz_grad(gt_sorted):
+    """Compute gradient of the Lovasz extension w.r.t sorted errors."""
+    gts = gt_sorted.sum()
+    intersection = gts - gt_sorted.float().cumsum(0)
+    union = gts + (1 - gt_sorted).float().cumsum(0)
+    jaccard = 1.0 - intersection / (union + 1e-6)
+    if gt_sorted.numel() > 1:
+        jaccard[1:] = jaccard[1:] - jaccard[:-1]
+    return jaccard
+
+
+def _flatten_binary_scores(scores, labels):
+    scores = scores.view(-1)
+    labels = labels.view(-1)
+    return scores, labels
+
+
+def _lovasz_hinge_flat(logits, labels):
+    if labels.numel() == 0:
+        return logits.new_tensor(0.0)
+    signs = 2.0 * labels.float() - 1.0
+    errors = 1.0 - logits * signs
+    errors_sorted, perm = torch.sort(errors, dim=0, descending=True)
+    perm = perm.data
+    gt_sorted = labels[perm]
+    grad = _lovasz_grad(gt_sorted)
+    return torch.dot(F.relu(errors_sorted), grad)
+
+
+def _lovasz_hinge(logits, labels, per_image=True):
+    if per_image:
+        losses = []
+        for logit_i, label_i in zip(logits, labels):
+            logit_i, label_i = _flatten_binary_scores(logit_i, label_i)
+            losses.append(_lovasz_hinge_flat(logit_i, label_i))
+        if len(losses) == 0:
+            return logits.new_tensor(0.0)
+        return torch.stack(losses).mean()
+    logits, labels = _flatten_binary_scores(logits, labels)
+    return _lovasz_hinge_flat(logits, labels)
+
+
+@LOSSES.register_module()
+class MaskLovaszLoss(nn.Module):
+    """Lovasz hinge loss for multi-label segmentation logits."""
+
+    def __init__(self, loss_weight=1.0, classes=None, per_image=True):
+        super(MaskLovaszLoss, self).__init__()
+        self.loss_weight = loss_weight
+        self.classes = classes
+        self.per_image = per_image
+
+    def forward(self, pred, target):
+        num_classes = pred.shape[1]
+        class_ids = self.classes if self.classes is not None else list(range(num_classes))
+        losses = []
+        for cls_idx in class_ids:
+            losses.append(_lovasz_hinge(
+                pred[:, cls_idx], target[:, cls_idx], per_image=self.per_image))
+        if len(losses) == 0:
+            return pred.new_tensor(0.0)
+        return self.loss_weight * torch.stack(losses).mean()
+
+
+def _soft_erode(img):
+    return -F.max_pool2d(-img, kernel_size=3, stride=1, padding=1)
+
+
+def _soft_dilate(img):
+    return F.max_pool2d(img, kernel_size=3, stride=1, padding=1)
+
+
+def _soft_open(img):
+    return _soft_dilate(_soft_erode(img))
+
+
+def _soft_skel(img, iters):
+    img = img.clamp(min=0.0, max=1.0)
+    img1 = _soft_open(img)
+    skel = F.relu(img - img1)
+    for _ in range(iters):
+        img = _soft_erode(img)
+        img1 = _soft_open(img)
+        delta = F.relu(img - img1)
+        skel = skel + F.relu(delta - skel * delta)
+    return skel
+
+
+@LOSSES.register_module()
+class SoftCLDiceLoss(nn.Module):
+    """Soft clDice loss for connectivity preservation on thin structures."""
+
+    def __init__(self, loss_weight=1.0, classes=None, iterations=10, eps=1e-6):
+        super(SoftCLDiceLoss, self).__init__()
+        self.loss_weight = loss_weight
+        self.classes = classes
+        self.iterations = int(iterations)
+        self.eps = eps
+
+    def forward(self, pred, target):
+        pred = pred.sigmoid()
+        num_classes = pred.shape[1]
+        class_ids = self.classes if self.classes is not None else list(range(num_classes))
+
+        losses = []
+        for cls_idx in class_ids:
+            p = pred[:, cls_idx:cls_idx+1]
+            t = target[:, cls_idx:cls_idx+1].float()
+            skel_p = _soft_skel(p, self.iterations)
+            skel_t = _soft_skel(t, self.iterations)
+
+            tprec = (skel_p * t).sum(dim=(1, 2, 3)) / (skel_p.sum(dim=(1, 2, 3)) + self.eps)
+            tsens = (skel_t * p).sum(dim=(1, 2, 3)) / (skel_t.sum(dim=(1, 2, 3)) + self.eps)
+            cl_dice = 1.0 - (2.0 * tprec * tsens) / (tprec + tsens + self.eps)
+            losses.append(cl_dice.mean())
+
+        if len(losses) == 0:
+            return pred.new_tensor(0.0)
+        return self.loss_weight * torch.stack(losses).mean()
+
+
+@LOSSES.register_module()
+class ActiveBoundaryLoss(nn.Module):
+    """Boundary alignment loss using Sobel edge magnitude consistency."""
+
+    def __init__(self, loss_weight=1.0, classes=None, eps=1e-6):
+        super(ActiveBoundaryLoss, self).__init__()
+        self.loss_weight = loss_weight
+        self.classes = classes
+        self.eps = eps
+
+        sobel_x = torch.tensor([[1., 0., -1.],
+                                [2., 0., -2.],
+                                [1., 0., -1.]], dtype=torch.float32)
+        sobel_y = torch.tensor([[1., 2., 1.],
+                                [0., 0., 0.],
+                                [-1., -2., -1.]], dtype=torch.float32)
+        self.register_buffer('sobel_x', sobel_x.view(1, 1, 3, 3))
+        self.register_buffer('sobel_y', sobel_y.view(1, 1, 3, 3))
+
+    def _edge_mag(self, x):
+        gx = F.conv2d(x, self.sobel_x, padding=1)
+        gy = F.conv2d(x, self.sobel_y, padding=1)
+        return torch.sqrt(gx * gx + gy * gy + self.eps)
+
+    def forward(self, pred, target):
+        pred = pred.sigmoid()
+        num_classes = pred.shape[1]
+        class_ids = self.classes if self.classes is not None else list(range(num_classes))
+        losses = []
+        for cls_idx in class_ids:
+            p = pred[:, cls_idx:cls_idx+1]
+            t = target[:, cls_idx:cls_idx+1].float()
+            p_edge = self._edge_mag(p)
+            t_edge = self._edge_mag(t)
+            losses.append(F.l1_loss(p_edge, t_edge))
+
+        if len(losses) == 0:
+            return pred.new_tensor(0.0)
+        return self.loss_weight * torch.stack(losses).mean()

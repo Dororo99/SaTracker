@@ -121,12 +121,30 @@ bash scripts/train_satmaptracker_stage1_skeleton.sh --skel-weight 2.0
 |----------|---------|-------------|
 | `--no-skeleton` | (skeleton ON) | Skeleton-Recall Loss 비활성화 |
 | `--skel-weight` | `1.0` | Skeleton loss weight (0.5, 1.0, 2.0 등) |
-| `--gpus` | `2,3` | 사용할 GPU (e.g., `0,1,2,3`) |
-| `--port` | `29570` | 분산 학습 master port |
+| `--gpus` | `0,1` | 사용할 GPU (e.g., `0,1,2,3`) |
+| `--port` | `29572` | 분산 학습 master port |
+| `--seed` | `0` | random seed |
+| `--deterministic` | `False` | cudnn deterministic 실행 |
 | `--wandb-name` | `...-dohyun` | WandB run 이름 |
 | `--wandb-project` | `Third-SatMAE_...` | WandB 프로젝트 이름 |
 | `--bev-vis-interval` | `500` | BEV 시각화 WandB 로깅 주기 (iter) |
 | `--config` | `satmaptracker_stage1_...` | Config 파일 경로 |
+| `--prior-only` | `False` | A1: prior-only residual logit correction 경로 사용 (cross-attn/conv-fusion OFF) |
+| `--prior-class-range-gate` | `False` | A2: class-aware + range-aware gate 활성화 |
+| `--prior-warp` | `False` | A3: prior warp head 활성화 |
+| `--use-lovasz` | `False` | B1-1: Lovasz loss 활성화 |
+| `--use-cldice` | `False` | B1-2: clDice loss 활성화 |
+| `--use-abl` | `False` | B1-3: Active Boundary Loss 활성화 |
+| `--dry-run` | `False` | 실행 없이 최종 training command/설정만 검증 |
+
+멀티시드 실행:
+
+```bash
+bash scripts/run_satmaptracker_stage1_multiseed.sh \
+  --seeds 0,1,2 \
+  --wandb-base sat_a3 \
+  --prior-only --prior-class-range-gate --prior-warp
+```
 
 ### WandB Logging
 

@@ -1,0 +1,120 @@
+_wandb:
+    value:
+        cli_version: 0.24.2
+        e:
+            o7bbshj4czel460z5v12p9r7hksxc8l4:
+                args:
+                    - --local_rank=0
+                    - plugin/configs/maptracker/nuscenes_newsplit/satmaptracker_stage1_bev_pretrain.py
+                    - --seed
+                    - "0"
+                    - --deterministic
+                    - --no-validate
+                    - --launcher
+                    - pytorch
+                    - --cfg-options
+                    - model.seg_cfg.loss_skel.type=SkelRecallLoss
+                    - model.seg_cfg.loss_skel.loss_weight=1.0
+                    - model.seg_cfg.loss_skel.skel_classes=[2]
+                    - model.sat_encoder_cfg.pretrained=None
+                    - model.use_sat_backbone_fusion=False
+                    - model.conv_fusion_cfg=None
+                    - model.use_sat_prior=True
+                    - model.use_sat_class_range_gate=True
+                    - model.prior_gate_cfg.class_logit_init=[-2.0,0.0,0.0]
+                    - model.prior_gate_cfg.range_center=12.0
+                    - model.prior_gate_cfg.range_scale=4.0
+                    - model.use_sat_prior_warp=True
+                    - model.sat_prior_warp_cfg.hidden_channels=64
+                    - model.sat_prior_warp_cfg.offset_scale=0.05
+                    - model.sat_prior_warp_cfg.offset_reg_weight=0.01
+                    - model.seg_cfg.loss_lovasz.loss_weight=0.5
+                    - model.seg_cfg.loss_cldice.loss_weight=0.15
+                    - model.seg_cfg.loss_cldice.classes=[1]
+                    - model.seg_cfg.loss_cldice.iterations=10
+                    - model.seg_cfg.loss_abl.loss_weight=0.08
+                    - model.seg_cfg.loss_abl.classes=[2]
+                    - log_config.hooks.1.init_kwargs.entity=IRCV_Mapping
+                    - log_config.hooks.1.init_kwargs.project=Third-SatMAE_MapTracker-AID4AD-seonghyun
+                    - log_config.hooks.1.init_kwargs.name=SatMAETracker_sig25_skel-1:b_add_
+                    - custom_hooks.0.interval=500
+                    - optimizer.lr=0.000125
+                    - runner.max_iters=27810
+                    - evaluation.interval=4635
+                    - checkpoint_config.interval=4635
+                    - data.workers_per_gpu=0
+                    - runner.max_iters=1
+                    - evaluation.interval=1000000
+                    - checkpoint_config.interval=1000000
+                codePath: tools/train.py
+                codePathLocal: tools/train.py
+                cpu_count: 64
+                cpu_count_logical: 128
+                cudaVersion: "12.8"
+                disk:
+                    /:
+                        total: "3800427847680"
+                        used: "2991484723200"
+                email: ldh991014@hanyang.ac.kr
+                executable: /home/dohyun/miniconda3/envs/maptracker/bin/python
+                git:
+                    commit: a781fe920444352a81ca47b1591a4a00b016046e
+                    remote: https://github.com/Dororo99/SaTracker.git
+                gpu: NVIDIA RTX A6000
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 10752
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX A6000
+                      uuid: GPU-1fbba5a5-55e2-7ec8-eac3-b957da37b3dc
+                    - architecture: Ampere
+                      cudaCores: 10752
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX A6000
+                      uuid: GPU-23d2de21-bdc6-9cb5-b869-7d4d39f02c6b
+                    - architecture: Ampere
+                      cudaCores: 10752
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX A6000
+                      uuid: GPU-4c413068-fd94-e358-5513-992616aabfca
+                    - architecture: Ampere
+                      cudaCores: 10752
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX A6000
+                      uuid: GPU-3b1ec938-8f09-bdbd-58e8-844eaf2551d1
+                host: neo
+                memory:
+                    total: "540697255936"
+                os: Linux-5.15.0-170-generic-x86_64-with-glibc2.17
+                program: tools/train.py
+                python: CPython 3.8.20
+                root: /home/dohyun/e2e/SaTracker
+                startedAt: "2026-04-06T06:53:27.506294Z"
+                writerId: o7bbshj4czel460z5v12p9r7hksxc8l4
+        m: []
+        python_version: 3.8.20
+        t:
+            "1":
+                - 1
+                - 5
+                - 37
+                - 38
+                - 41
+                - 53
+                - 60
+            "2":
+                - 1
+                - 5
+                - 37
+                - 38
+                - 41
+                - 53
+                - 60
+            "3":
+                - 2
+                - 13
+            "4": 3.8.20
+            "5": 0.24.2
+            "12": 0.24.2
+            "13": linux-x86_64

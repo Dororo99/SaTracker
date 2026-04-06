@@ -41,6 +41,8 @@ class MapTracker(BaseMapper):
                  use_memory=False,
                  mem_len=None,
                  mem_warmup_iters=-1,
+                 seg_score_thr=0.4,
+                 seg_class_score_thrs=None,
                  **kwargs):
         super().__init__()
 
@@ -63,6 +65,9 @@ class MapTracker(BaseMapper):
         self.track_fp_aug = track_fp_aug
         self.use_memory = use_memory
         self.mem_warmup_iters = mem_warmup_iters
+        self.seg_score_thr = float(seg_score_thr)
+        self.seg_class_score_thrs = ([float(v) for v in seg_class_score_thrs]
+                                     if seg_class_score_thrs is not None else None)
 
         # the track query propagation module, using relative pose
         c_dim = 7 # quaternion for rotation (4) + translation (3)
@@ -107,6 +112,15 @@ class MapTracker(BaseMapper):
         self.register_buffer('plane', plane.double())
         
         self.init_weights(pretrained)
+
+    def _get_seg_positive_ids(self, tmp_scores, tmp_labels):
+        if self.seg_class_score_thrs is None:
+            return tmp_scores >= self.seg_score_thr
+        class_thrs = tmp_scores.new_tensor(self.seg_class_score_thrs)
+        if class_thrs.numel() <= int(tmp_labels.max()):
+            return tmp_scores >= self.seg_score_thr
+        per_pixel_thr = class_thrs[tmp_labels]
+        return tmp_scores >= per_pixel_thr
 
     def init_weights(self, pretrained=None):
         """Initialize model weights."""
@@ -687,7 +701,7 @@ class MapTracker(BaseMapper):
             tmp_scores, tmp_labels = seg_preds[b_i].max(0)
             tmp_scores = tmp_scores.sigmoid()
             preds_i = torch.zeros(tmp_labels.shape, dtype=torch.uint8).to(tmp_scores.device)
-            pos_ids = tmp_scores >= 0.4
+            pos_ids = self._get_seg_positive_ids(tmp_scores, tmp_labels)
             preds_i[pos_ids] = tmp_labels[pos_ids].type(torch.uint8) + 1
             preds_i = preds_i.cpu().numpy()
             results_list[b_i]['semantic_mask'] = preds_i

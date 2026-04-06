@@ -86,6 +86,29 @@ model = dict(
     use_memory=False,
     mem_len=4,
     mem_warmup_iters=500,
+    seg_score_thr=0.4,
+    seg_class_score_thrs=[0.4, 0.35, 0.4],  # [ped_crossing, divider, boundary]
+    use_sat_backbone_fusion=True,
+    use_sat_prior=False,
+    use_sat_class_range_gate=False,
+    prior_gate_cfg=dict(
+        class_logit_init=[-2.0, 0.0, 0.0],  # [ped_crossing, divider, boundary]
+        range_center=12.0,
+        range_scale=4.0,
+    ),
+    use_sat_prior_warp=False,
+    sat_prior_warp_cfg=dict(
+        hidden_channels=64,
+        offset_scale=0.05,
+        offset_reg_weight=0.01,
+    ),
+    sat_prior_cfg=dict(
+        type='SatSemanticPriorHead',
+        in_channels=bev_embed_dims,
+        hidden_channels=bev_embed_dims,
+        num_classes=num_class,
+        delta_scale_init=0.1,
+    ),
     # ===== Satellite Encoder (SatMAE ViT-L, frozen) =====
     sat_encoder_cfg=dict(
         type='SatMAEEncoder',
@@ -288,15 +311,32 @@ model = dict(
             type='MaskFocalLoss',
             use_sigmoid=True,
             loss_weight=10.0,
+            class_weights=[1.0, 1.5, 1.0],  # emphasize divider
         ),
         loss_dice=dict(
             type='MaskDiceLoss',
             loss_weight=1.0,
         ),
+        loss_lovasz=dict(
+            type='MaskLovaszLoss',
+            loss_weight=0.0,
+            per_image=True,
+        ),
+        loss_cldice=dict(
+            type='SoftCLDiceLoss',
+            loss_weight=0.0,
+            classes=[1],
+            iterations=10,
+        ),
+        loss_abl=dict(
+            type='ActiveBoundaryLoss',
+            loss_weight=0.0,
+            classes=[2],
+        ),
         loss_skel=dict(
             type='SkelRecallLoss',
             loss_weight=1.0,
-            skel_classes=[1, 2],
+            skel_classes=[2],
         ),
     ),
     model_name='SingleStage'
@@ -322,7 +362,7 @@ train_pipeline = [
     ),
     dict(
         type='SkeletonizeMap',
-        skel_classes=[1, 2],
+        skel_classes=[2],
         num_dilations=1,  # options: 0, 1, 2
     ),
     dict(type='LoadMultiViewImagesFromFiles', to_float32=True),
@@ -476,7 +516,7 @@ log_config = dict(
             init_kwargs=dict(
                 entity='IRCV_Mapping',
                 project='Third-SatMAE_MapTracker-AID4AD-seonghyun',
-                name='SaTracker-res18-skeleton-dil=1'
+                name='SaTracker-res18-skeleton=b-dil=1'
             )
         )
     ])

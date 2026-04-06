@@ -25,6 +25,9 @@ class MapSegHead(nn.Module):
                  loss_seg=dict(),
                  loss_dice=dict(),
                  loss_skel=None,
+                 loss_lovasz=None,
+                 loss_cldice=None,
+                 loss_abl=None,
         ):
         super().__init__()
         self.num_classes = num_classes
@@ -42,6 +45,27 @@ class MapSegHead(nn.Module):
         else:
             self.loss_skel = None
             self.use_skel_loss = False
+
+        if loss_lovasz is not None:
+            self.loss_lovasz = build_loss(loss_lovasz)
+            self.use_lovasz_loss = True
+        else:
+            self.loss_lovasz = None
+            self.use_lovasz_loss = False
+
+        if loss_cldice is not None:
+            self.loss_cldice = build_loss(loss_cldice)
+            self.use_cldice_loss = True
+        else:
+            self.loss_cldice = None
+            self.use_cldice_loss = False
+
+        if loss_abl is not None:
+            self.loss_abl = build_loss(loss_abl)
+            self.use_abl_loss = True
+        else:
+            self.loss_abl = None
+            self.use_abl_loss = False
 
         if self.loss_seg.use_sigmoid:
             self.cls_out_channels = num_classes
@@ -75,13 +99,8 @@ class MapSegHead(nn.Module):
             bias_init = bias_init_with_prob(0.01)
             m = self.conv_out
             nn.init.constant_(m.bias, bias_init)
-    
-    def forward_train(self, bev_features, gts, history_coords, skel_gts=None):
-        x = self.relu(self.conv_in(bev_features))
-        for conv_mid in self.conv_mid_layers:
-            x = conv_mid(x)
-        preds = self.conv_out(x)
 
+    def compute_losses(self, preds, gts, skel_gts=None):
         seg_loss = self.loss_seg(preds, gts)
         dice_loss = self.loss_dice(preds, gts)
 
@@ -89,6 +108,45 @@ class MapSegHead(nn.Module):
             skel_loss = self.loss_skel(preds, skel_gts)
         else:
             skel_loss = preds.new_tensor(0.0)
+
+        if self.use_lovasz_loss:
+            lovasz_loss = self.loss_lovasz(preds, gts)
+        else:
+            lovasz_loss = preds.new_tensor(0.0)
+
+        if self.use_cldice_loss:
+            cldice_loss = self.loss_cldice(preds, gts)
+        else:
+            cldice_loss = preds.new_tensor(0.0)
+
+        if self.use_abl_loss:
+            abl_loss = self.loss_abl(preds, gts)
+        else:
+            abl_loss = preds.new_tensor(0.0)
+
+        return dict(
+            seg=seg_loss,
+            dice=dice_loss,
+            skel=skel_loss,
+            lovasz=lovasz_loss,
+            cldice=cldice_loss,
+            abl=abl_loss,
+        )
+    
+    def forward_train(self, bev_features, gts, history_coords, skel_gts=None):
+        x = self.relu(self.conv_in(bev_features))
+        for conv_mid in self.conv_mid_layers:
+            x = conv_mid(x)
+        preds = self.conv_out(x)
+        losses = self.compute_losses(preds, gts, skel_gts=skel_gts)
+        self._last_aux_losses = dict(
+            seg_lovasz=losses['lovasz'],
+            seg_cldice=losses['cldice'],
+            seg_abl=losses['abl'],
+        )
+        seg_loss = losses['seg'] + losses['lovasz'] + losses['cldice'] + losses['abl']
+        dice_loss = losses['dice']
+        skel_loss = losses['skel']
 
         # downsample the features to the original bev size
         seg_feats = x
