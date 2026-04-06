@@ -124,34 +124,40 @@ class SatCamConvFusion(nn.Module):
 
 @NECKS.register_module()
 class SatelliteConvFuser(nn.Module):
-    """SatMap-style ConvFuser: concat + conv fusion (BEVFusion baseline).
+    """SatMap-style ConvFuser: concat + conv fusion.
 
-    No residual connection. Projects both modalities, concatenates,
-    then processes through conv blocks.
+    Projects both modalities, concatenates, then processes through conv blocks.
+    Optional camera residual connection preserves cam_bev distribution.
 
     Reference: SatMap (arXiv:2601.10512), BEVFusion (ICRA 2023)
 
     Args:
         in_channels (int): Input channels per modality.
         hidden_channels (int): Hidden channels in conv blocks.
+        use_residual (bool): Add camera BEV residual connection.
     """
 
-    def __init__(self, in_channels=256, hidden_channels=256):
+    def __init__(self, in_channels=256, hidden_channels=256, use_residual=False):
         super().__init__()
+        self.use_residual = use_residual
         self.proj_cam = nn.Conv2d(in_channels, hidden_channels, 1, bias=False)
         self.proj_sat = nn.Conv2d(in_channels, hidden_channels, 1, bias=False)
-        self.fuse = nn.Sequential(
+        layers = [
             nn.Conv2d(hidden_channels * 2, hidden_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(hidden_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, in_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True),
-        )
+        ]
+        if not use_residual:
+            layers.append(nn.ReLU(inplace=True))
+        self.fuse = nn.Sequential(*layers)
 
     def forward(self, cam_bev, sat_bev):
         cam_proj = self.proj_cam(cam_bev)
         sat_proj = self.proj_sat(sat_bev)
         concat = torch.cat([cam_proj, sat_proj], dim=1)
         fused = self.fuse(concat)
+        if self.use_residual:
+            fused = fused + cam_bev
         return fused, {}

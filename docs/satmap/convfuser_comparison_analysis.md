@@ -104,7 +104,7 @@ AID4AD ─→ SimpleSatEncoder ──→ sat_bev─┘
   → camera가 만든 적 없는 distribution → mismatch 발생
 - 단순 addition → scale/distribution 차이 학습 불가
 
-### Kyungmin v6 (Stage 1, 현재 학습 중) — history_mode='fused'
+### Kyungmin v7 (Stage 1, 완료) — history_mode='fused', 공유 decoder
 
 ```
                                       history_bev_feats (fused)
@@ -121,16 +121,89 @@ AID4AD ─→ SatelliteEncoder ──→ sat_bev ───────┘       
           (ResNet50+FPN)                                    │
                                                             │
           추가 branch (current frame only):                 │
-          cam_bev ──→ seg_decoder ──→ seg_loss ② (cam supervision)
-          sat_bev ──→ seg_decoder ──→ seg_loss ③ (sat supervision)
+          cam_bev ──→ seg_decoder ──→ seg_loss ② (cam supervision)  ← 공유!
+          sat_bev ──→ seg_decoder ──→ seg_loss ③ (sat supervision)  ← 공유!
 
                               total_loss = fused(parent) + ② + ③
 ```
 
-- Sumin 대비 차이: sat_bev supervision ③ 추가 (triple)
-- **주의**: history_mode='fused' → fused_bev가 history에 들어감
-  → v5와 동일한 temporal mismatch 문제가 존재
-  → history_mode='cam'으로 ablation 필요
+- ConvFuser: residual 없음, sat backbone full lr (1.0x), cam backbone 0.1x
+- **seg_decoder를 cam/sat/fused 3개가 공유** → gradient 간섭 문제
+
+#### v7 실험 결과 (third split, 18 epoch)
+
+| epoch | fused mIoU | cam mIoU | sat mIoU |
+|-------|-----------|---------|---------|
+| 3     | **0.492** | **0.482** | 0.383 |
+| 6     | 0.480     | 0.471   | 0.394 |
+| 9     | 0.464     | 0.456   | 0.400 |
+| 12    | 0.452     | 0.450   | 0.407 |
+| 15    | 0.438     | 0.439   | 0.404 |
+| 18    | 0.429     | 0.432   | 0.404 |
+
+**문제**: epoch 3이 피크, 이후 cam/fused 지속 하락. sat만 완만히 상승.
+
+**원인 분석**:
+1. 공유 seg_decoder가 fused/sat 분포 쪽으로 shift → cam-only 평가 성능 하락
+2. fusion에 residual 없음 → cam_bev가 "sat과 합쳐졌을 때 좋은 feature"로 변질
+   → cam 단독 품질 저하
+
+### Kyungmin v8 (Stage 1, 실패) — residual + sat lr 0.1x
+
+v7의 문제를 해결하기 위해 residual + sat backbone lr 0.1x를 시도.
+
+- ConvFuser: **use_residual=True**, sat backbone **0.1x**, cam backbone 0.1x
+- seg_decoder: 공유 (v7과 동일)
+
+| epoch | fused mIoU | cam mIoU | sat mIoU |
+|-------|-----------|---------|---------|
+| 3     | 0.473     | 0.462   | 0.332 |
+| 6     | 0.455     | 0.445   | 0.326 |
+
+**결론**: sat backbone lr 0.1x가 주범. sat 학습이 너무 느려서 adaptation이 안 됨.
+- satonly 실험에서도 sat backbone은 paramwise_cfg 없이 full lr로 학습했음
+- v7에서도 sat 1.0x로 sat mIoU가 정상적으로 올라갔음
+- → sat backbone을 0.1x로 줄인 것은 불필요한 제약
+
+### Kyungmin v9 (Stage 1, 현재) — 분리 decoder + residual + sat lr 1.0x
+
+v7/v8의 두 문제를 동시에 해결:
+
+```
+                                      history_bev_feats (fused)
+                                              ↑ append
+                                              │
+Camera ─→ BEVFormerBackbone ──→ cam_bev ──────┤
+             ↑ temporal                       │
+             │ self-attn                      │
+             │                    ConvFuser(+residual) ──→ fused_bev
+          history_bev ←──────────────→  ↑                    │
+          (fused)                        │                    ├──→ seg_decoder     ──→ seg_loss (fused)
+                                         │                    │
+AID4AD ─→ SatelliteEncoder ──→ sat_bev──┘                    │
+          (ResNet50+FPN, lr 1.0x)                             │
+                                                              │
+          추가 branch (current frame only):                   │
+          cam_bev ──→ seg_decoder_cam ──→ seg_loss ② (cam 전용)
+          sat_bev ──→ seg_decoder_sat ──→ seg_loss ③ (sat 전용)
+
+                              total_loss = fused(parent) + ② + ③
+```
+
+**변경점 (v7 대비)**:
+1. **분리 decoder**: cam/sat 각각 전용 seg_decoder. fused는 parent seg_decoder 사용
+   - gradient가 깨끗: cam_decoder → cam backbone만, sat_decoder → sat backbone만
+   - fused_decoder → fused에만 최적화
+   - 진단 지표 오염 해결: cam mIoU 하락이 feature 문제인지 decoder shift인지 구분 가능
+   - MapSegHead가 conv 3개 수준으로 가벼워 3개로 늘려도 파라미터 부담 거의 없음
+2. **ConvFuser residual**: `fused = Conv(cat(cam, sat)) + cam_bev`
+   - cam 분포 구조적 보존, fusion이 additive delta만 학습
+3. **sat backbone full lr (1.0x)**: v7/satonly와 동일. ImageNet pretrained → driving 도메인 adaptation에 충분한 lr 필요
+
+**LR 설정**:
+- img_backbone: 0.1x (detectron2 pretrained, BEVFormer 원본 설정 유지)
+- sat_encoder.backbone: 1.0x (ImageNet pretrained, adaptation 필요)
+- fusion, decoder, 기타: 1.0x
 
 ---
 
@@ -233,28 +306,31 @@ fused = gamma * BN(cam_bev) + beta + cam_bev
 
 ---
 
-## 7. v6 설계 방향 논의
+## 7. 설계 방향 (v9 기준)
 
 ### 핵심 설계 원칙
 
-1. **History buffer는 cam_bev only**: MapTracker의 temporal 구조를 보존
-2. **Fusion은 prediction 직전에만**: Sumin 방식처럼 별도 branch
-3. **Triple supervision**: cam_bev / fused_bev / sat_bev 각각 같은 seg_decoder로 supervision
-4. **Learnable fusion**: addition이 아닌 학습 가능한 방법
+1. **분리 decoder**: cam/sat/fused 각각 전용 seg_decoder → gradient 간섭 제거, 진단 정확도 향상
+2. **ConvFuser + residual**: fusion output = Conv(cat(cam, sat)) + cam_bev → cam 분포 보존
+3. **sat backbone full lr**: ImageNet pretrained → driving 도메인 adaptation에 1.0x 필요
+4. **History buffer는 fused_bev**: per-frame aligned satellite 정보가 temporal에 반영
 
-### Fusion 방식 후보
+### 분리 decoder의 이점
 
-Triple supervision을 쓰려면 **대칭 fusion**이 적합 (①②③이 충분히 달라야 의미 있음):
+- cam_decoder gradient → cam backbone만, sat_decoder gradient → sat backbone만
+- fused_decoder → fusion conv + 양쪽 backbone으로 gradient 전달
+- cam mIoU 하락 시 원인 특정 가능 (feature 품질 vs decoder 편향)
+- MapSegHead가 conv 3개 수준으로 가벼워 파라미터 부담 거의 없음
 
-| 방식 | 설명 | Triple supervision 궁합 |
-|------|------|------------------------|
-| ConvFuser (concat+conv) | 검증됨 (0.514), baseline | O (대칭) |
-| Channel Attention Fusion (SE-Net 스타일) | concat → GAP → FC → channel weight | O (대칭) |
-| AdaptiveFusion (gating) | 픽셀별 비율 학습 | O (대칭) |
-| ConditionedModulation (FiLM) | satellite이 camera를 modulate | X (비대칭, fused ≈ cam) |
+### 향후 확장: Feature Selection 모듈
+
+분리 decoder가 있으면 cam/sat/fused 각각의 prediction confidence를 독립적으로 측정 가능.
+이를 기반으로 step마다 best feature를 선택하여 memory에 저장하는 구조로 확장 가능:
+- 각 decoder의 sigmoid confidence (max or entropy) 기반
+- 또는 별도 learned quality estimator
 
 ### 미결 사항
 
-- **인코더 선택**: SimpleSatEncoder vs SatelliteEncoder(ResNet50+FPN) — 별개로 실험 필요
-- **sat_bev supervision 효과**: sat_bev only로 seg_decoder 학습 시 초반 불안정 가능 → loss weight 조절 (예: 0.3배)
-- **Stage 2/3 전환**: fusion branch가 Stage 2/3에서 vector head와 어떻게 연동되는지 설계 필요
+- **history_mode='cam' ablation**: fused_bev를 history에 넣는 것의 temporal mismatch 문제 재검증
+- **aux loss weight**: cam/sat aux loss가 fused와 동일 weight(1:1:1)인데, 조절 필요할 수 있음
+- **Stage 2/3 ���환**: 분리 decoder 구조가 vector head와 어떻게 연동되는지 설계 필요

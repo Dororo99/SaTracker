@@ -83,7 +83,11 @@ model = dict(
     mem_len=4,
     mem_warmup_iters=500,
     # ── Satellite fusion ──
-    history_mode='fused',       # 'fused' or 'cam' for ablation
+    # Temporal history carries pure cam_bev; fusion is applied only at the
+    # current frame via seg_decoder_fused. 'fused' mode is deprecated because
+    # fused_bev in the history caused TemporalSelfAttention to drift along
+    # with the fusion layer during training.
+    history_mode='cam',
     freeze_sat_encoder=False,
     sat_encoder_cfg=dict(
         type='SatelliteEncoder',
@@ -106,6 +110,7 @@ model = dict(
         type='SatelliteConvFuser',
         in_channels=bev_embed_dims,
         hidden_channels=bev_embed_dims,
+        use_residual=True,
     ),
     # ── Camera backbone (same as MapTracker) ──
     backbone_cfg=dict(
@@ -220,7 +225,7 @@ model = dict(
                       reg_cost=dict(type='LinesL1Cost', weight=50.0,
                                     beta=0.01, permute=permute))),
     ),
-    # ── Shared seg decoder (used for cam/sat/fused triple supervision) ──
+    # ── Seg decoder (fused=parent seg_decoder, cam/sat=separate decoders) ──
     seg_cfg=dict(
         type='MapSegHead',
         num_classes=num_class,

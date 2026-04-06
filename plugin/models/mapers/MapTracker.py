@@ -855,6 +855,9 @@ class MapTracker(BaseMapper):
         # Neck
         bev_feats = self.neck(_bev_feats)
 
+        # Store last-frame BEV features for subclass access (mirrors forward_train:743)
+        self._last_bev_feats = bev_feats
+
         # SD prior encoding (shared for both first_frame and non-first_frame)
         sd_prior_features, sd_prior_mask, sd_prior_coords = None, None, None
         if self.use_sd_prior:
