@@ -24,6 +24,7 @@ class MapSegHead(nn.Module):
                  canvas_size=(200,100),
                  loss_seg=dict(),
                  loss_dice=dict(),
+                 loss_skeleton=None,
         ):
         super().__init__()
         self.num_classes = num_classes
@@ -34,6 +35,7 @@ class MapSegHead(nn.Module):
 
         self.loss_seg = build_loss(loss_seg)
         self.loss_dice = build_loss(loss_dice)
+        self.loss_skeleton = build_loss(loss_skeleton) if loss_skeleton is not None else None
 
         if self.loss_seg.use_sigmoid:
             self.cls_out_channels = num_classes
@@ -76,6 +78,8 @@ class MapSegHead(nn.Module):
 
         seg_loss = self.loss_seg(preds, gts)
         dice_loss = self.loss_dice(preds, gts)
+        if self.loss_skeleton is not None:
+            seg_loss = seg_loss + self.loss_skeleton(preds, gts)
         
         # downsample the features to the original bev size
         seg_feats = x

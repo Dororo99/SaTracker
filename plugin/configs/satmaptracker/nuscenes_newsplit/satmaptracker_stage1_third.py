@@ -36,6 +36,21 @@ checkpoint_config = dict(interval=num_epochs_interval * num_iters_per_epoch)
 runner = dict(
     type='MyRunnerWrapper', max_iters=num_epochs * num_iters_per_epoch)
 
+# Add skeleton regularization to main seg loss only (cam branch).
+model = dict(
+    skeleton_main_only=True,
+    seg_cfg=dict(
+        loss_skeleton=dict(
+            type='MaskSkeletonLoss',
+            loss_weight=1.0,  # target ratio (config-level): focal:dice:skeleton = 10:1:1
+            num_dilation=1,
+            class_indices=[1, 2],  # divider, boundary
+            class_weights=[2.0, 1.0],  # divider:boundary = 2:1
+            ignore_empty_targets=True,
+        ),
+    ),
+)
+
 # Model config inherited from base (history_mode='cam', residual fusion, etc.)
 # Optimizer config inherited from base (both backbones at lr_mult=0.1).
 
@@ -47,7 +62,7 @@ log_config = dict(
         dict(type='WandbLoggerHook',
              init_kwargs=dict(
                  entity='IRCV_Mapping',
-                 project='Third-SatFuse-AID4AD-Kyungmin',
-                 name='satmaptracker-stage1-third-cam-v2',
+                 project='Third-SaTracker-dohyun-v2',
+                 name='satracker-stage1-third-skel',
              )),
     ])

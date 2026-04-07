@@ -47,6 +47,7 @@ class SatMapTracker(MapTracker):
                  sat_fusion_cfg=None,
                  freeze_sat_encoder=False,
                  history_mode='cam',
+                 skeleton_main_only=False,
                  seg_cfg=None,
                  **kwargs):
         kwargs.setdefault('use_sd_prior', False)
@@ -81,8 +82,13 @@ class SatMapTracker(MapTracker):
         #   self.seg_decoder_fused   (new)         : fused branch — current frame only, eval main
         #   self.seg_decoder_sat     (kept)        : sat branch  — current frame only
         if seg_cfg is not None:
-            self.seg_decoder_fused = build_head(copy.deepcopy(seg_cfg))
-            self.seg_decoder_sat = build_head(copy.deepcopy(seg_cfg))
+            seg_cfg_fused = copy.deepcopy(seg_cfg)
+            seg_cfg_sat = copy.deepcopy(seg_cfg)
+            if skeleton_main_only:
+                seg_cfg_fused.pop('loss_skeleton', None)
+                seg_cfg_sat.pop('loss_skeleton', None)
+            self.seg_decoder_fused = build_head(seg_cfg_fused)
+            self.seg_decoder_sat = build_head(seg_cfg_sat)
         else:
             self.seg_decoder_fused = None
             self.seg_decoder_sat = None
